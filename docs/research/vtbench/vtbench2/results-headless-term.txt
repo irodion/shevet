@@ -1,0 +1,12 @@
+plain            | h
+truecolor fg     | X has=true rgb(255,100,0)
+256color fg      | Y has=true rgb(0,0,0)
+split escape     | Z has=true rgb(0,255,0)
+CJK width        | [0]="你" [1]=" " [2]="A"
+emoji cluster    | [0]="👩" [1]=" " [2]="🚀"
+alt screen       | alt="A" restored="m"
+scroll region    | top="ROW1··" row2="······" bottom="ROW6··"
+insert line IL   | row2="····" row3="BBB·"
+scrollback       | len=15
+resize           | ok cell0="R"
+dirty cells      | DirtyCells=9 HasDirty=true

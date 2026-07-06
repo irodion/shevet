@@ -1,0 +1,3 @@
+charm x/vt :      7.0 MB in  1.03s =     6.8 MB/s
+vt10x      :      7.0 MB in  189ms =    37.2 MB/s
+midterm    :      7.0 MB in  222ms =    31.7 MB/s

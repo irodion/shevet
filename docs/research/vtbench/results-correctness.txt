@@ -1,0 +1,19 @@
+TEST             | charm x/vt                        | vt10x                             | midterm                           | vaxis/term                       
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+plain            | h                                 | h                                 | h                                 | h                                
+truecolor fg     | X has=true rgb(255,100,0)         | X has=true rgb(255,100,0)         | X has=true #ff6400                | [ has=false                      
+256color fg      | Y has=true rgb(255,0,0)           | Y has=true idx(196)               | Y has=true #ff0000                | [ has=false                      
+split escape     | Z has=true rgb(0,255,0)           | Z has=true rgb(0,255,0)           | Z has=true #00ff00                | [ has=false                      
+CJK width        | [0]="你" [1]="" [2]="A"            | [0]="你" [1]="A" [2]=" "           | [0]="你" [1]="A" [2]=" "           | [0]="你" [1]="<none>" [2]="A"     
+emoji cluster    | [0]="👩\u200d🚀" [1]="" [2]="B"     | [0]="👩" [1]="\u200d" [2]="🚀"      | [0]="👩" [1]="\u200d" [2]="🚀"      | [0]="👩\u200d" [1]="<none>" [2]="...
+alt screen       | alt="A" restored="m"              | alt="A" restored="m"              | alt="A" restored="m"              | alt="m" restored="m"             
+scroll region    | top="ROW1  " row2="ROW4  " bottom="... | top="ROW1··" row2="ROW4··" bott... | top="ROW1··" row2="ROW4··" bott... | top="ROW3··" row2="ROW4··" bott...
+insert line IL   | row2="    " row3="BBB "           | row2="····" row3="BBB·"           | row2="····" row3="BBB·"           | row2="BBB·" row3="CCC["          
+scrollback       | len=15                            | len=-1                            | len=-1                            | len=-1                           
+resize           | ok cell0="R"                      | ok cell0="R"                      | ok cell0="R"                      | ok cell0="R"                     
+
+--- damage/dirty APIs ---
+charm Touched() lines: 6 (nil-safe: true)
+midterm Changes per row: [5 4 0 0 0 0]
+vt10x: coarse ChangeFlag only (ChangedScreen/ChangedTitle), no per-cell/per-row damage
+vaxis/term: internal dirty flag only; Snapshot() is the exported read path

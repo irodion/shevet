@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+/shevet
+/vtbench
+
+# Editor
+.idea/
+.vscode/
