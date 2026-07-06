@@ -1,0 +1,39 @@
+// Shevet wire protocol, v1.
+//
+// This package defines the gRPC surface between the Server (`shevet serve`)
+// and Clients (`shevet connect`). It is served on a unix socket and reached
+// through an SSH tunnel; SSH is the sole authentication and authorization
+// boundary (see docs/adr/0003-grpc-over-ssh-tunnel.md).
+//
+// Vocabulary (Herd, Pane, Agent, ...) follows CONTEXT.md.
+//
+// Regenerate with `make proto`.
+syntax = "proto3";
+
+package shevet.v1;
+
+option go_package = "github.com/irodion/shevet/proto/shevet/v1;shevetv1";
+
+// HerdService is the Server's control-plane API: enumerating and (in later
+// slices) managing the Panes that make up the Herd.
+service HerdService {
+  // ListPanes returns every Pane currently in the Herd.
+  rpc ListPanes(ListPanesRequest) returns (ListPanesResponse);
+}
+
+message ListPanesRequest {}
+
+message ListPanesResponse {
+  repeated Pane panes = 1;
+}
+
+// Pane is one Agent's terminal surface, owned by tmux and interpreted by the
+// Server (see CONTEXT.md). Fields are additive; later slices extend this
+// message with Status, provenance (Spawned/Adopted), and geometry.
+message Pane {
+  // id is the Server-scoped stable identifier of the Pane.
+  string id = 1;
+
+  // title is a human-readable label for dashboards.
+  string title = 2;
+}
