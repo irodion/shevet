@@ -83,19 +83,14 @@ func (s *Server) Serve(ctx context.Context) error {
 	// The watcher's lifetime nests inside Serve: canceled with ctx, and
 	// its pipelines are closed before Serve returns (watcher.run's defer),
 	// which in turn releases any WatchPane handlers GracefulStop waits on.
-	watchCtx, stopWatcher := context.WithCancel(ctx)
-	watcherDone := make(chan struct{})
-	close(watcherDone)
-	defer func() {
-		stopWatcher()
-		<-watcherDone // watcher teardown (pipelines, tmux client) completes before Serve returns
-	}()
 	if s.opts.Tmux != nil {
+		watchCtx, stopWatcher := context.WithCancel(ctx)
 		w, err := attachWatcher(watchCtx, *s.opts.Tmux, s.registry, s.hub, s.log)
 		if err != nil {
+			stopWatcher()
 			return fmt.Errorf("attach to tmux: %w", err)
 		}
-		watcherDone = make(chan struct{})
+		watcherDone := make(chan struct{})
 		go func() {
 			defer close(watcherDone)
 			if err := w.run(watchCtx); err != nil {
@@ -105,6 +100,10 @@ func (s *Server) Serve(ctx context.Context) error {
 				// slice's business.
 				s.log.Error("tmux watcher stopped", "error", err)
 			}
+		}()
+		defer func() {
+			stopWatcher()
+			<-watcherDone // watcher teardown (pipelines, tmux client) completes before Serve returns
 		}()
 		s.log.Info("watching tmux session", "session", s.opts.Tmux.Session, "tmux_socket", s.opts.Tmux.Socket)
 	}

@@ -146,7 +146,7 @@ func TestWatch_PicksTheFirstPane(t *testing.T) {
 
 func TestWatch_RendersDamage(t *testing.T) {
 	m, _ := watchingModel(t, []client.PaneUpdate{
-		{Resized: &[2]int{10, 3}},
+		{Resized: &grid.Size{W: 10, H: 3}},
 		{
 			Damage: []grid.CellPatch{
 				{X: 0, Y: 0, Cell: grid.Cell{Content: "h", Width: 1}},
@@ -167,12 +167,12 @@ func TestWatch_RendersDamage(t *testing.T) {
 
 func TestWatch_ResizeResetsContent(t *testing.T) {
 	m, _ := watchingModel(t, []client.PaneUpdate{
-		{Resized: &[2]int{10, 3}},
+		{Resized: &grid.Size{W: 10, H: 3}},
 		{
 			Damage: []grid.CellPatch{{X: 0, Y: 0, Cell: grid.Cell{Content: "X", Width: 1}}},
 			Cursor: grid.Cursor{X: 1, Y: 0},
 		},
-		{Resized: &[2]int{5, 2}},
+		{Resized: &grid.Size{W: 5, H: 2}},
 	})
 
 	if got := viewContent(m); strings.Contains(got, "X") {
@@ -182,7 +182,7 @@ func TestWatch_ResizeResetsContent(t *testing.T) {
 
 func TestWatch_PaneExit(t *testing.T) {
 	m, _ := watchingModel(t, []client.PaneUpdate{
-		{Resized: &[2]int{10, 3}},
+		{Resized: &grid.Size{W: 10, H: 3}},
 		{Exited: true},
 	})
 

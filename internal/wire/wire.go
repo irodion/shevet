@@ -58,6 +58,30 @@ func PatchFromProto(p *shevetv1.CellPatch) grid.CellPatch {
 	}
 }
 
+// DamageToProto converts a damage batch (cell patches plus the cursor state
+// at flush time) to its wire representation.
+func DamageToProto(cells []grid.CellPatch, cursor grid.Cursor) *shevetv1.CellDamage {
+	out := &shevetv1.CellDamage{
+		Cells:  make([]*shevetv1.CellPatch, 0, len(cells)),
+		Cursor: CursorToProto(cursor),
+	}
+	for _, p := range cells {
+		out.Cells = append(out.Cells, PatchToProto(p))
+	}
+	return out
+}
+
+// DamageFromProto converts a wire damage batch to its domain representation.
+// The returned slice is never nil: an empty batch is still a batch (it
+// carries the cursor).
+func DamageFromProto(d *shevetv1.CellDamage) ([]grid.CellPatch, grid.Cursor) {
+	cells := make([]grid.CellPatch, 0, len(d.GetCells()))
+	for _, p := range d.GetCells() {
+		cells = append(cells, PatchFromProto(p))
+	}
+	return cells, CursorFromProto(d.GetCursor())
+}
+
 // CursorToProto converts a cursor to its wire representation.
 func CursorToProto(c grid.Cursor) *shevetv1.Cursor {
 	return &shevetv1.Cursor{

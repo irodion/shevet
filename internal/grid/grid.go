@@ -76,6 +76,12 @@ type Cursor struct {
 	Hidden bool
 }
 
+// Size is a grid size in cells, for APIs that pass one around (resize
+// updates on the wire and in the pipeline).
+type Size struct {
+	W, H int
+}
+
 // CellPatch is one cell update: the damage unit carried on the wire.
 type CellPatch struct {
 	X, Y int
@@ -187,14 +193,4 @@ func (g *Grid) RowText(y int) string {
 		end--
 	}
 	return string(b[:end])
-}
-
-// CopyInto copies g's size and content into dst, reusing dst's storage when
-// the sizes already match.
-func (g *Grid) CopyInto(dst *Grid) {
-	if dst.w != g.w || dst.h != g.h {
-		dst.w, dst.h = g.w, g.h
-		dst.cells = make([]Cell, g.w*g.h)
-	}
-	copy(dst.cells, g.cells)
 }

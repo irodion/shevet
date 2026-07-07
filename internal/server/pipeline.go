@@ -21,9 +21,9 @@ const subscriberBuffer = 64
 // orthogonal: a resize and damage may travel together (resize first on the
 // wire); exited is terminal.
 type renderUpdate struct {
-	// resized, when non-nil, is the pane's new {width, height}. Receivers
-	// reset their grid to default cells.
-	resized *[2]int
+	// resized, when non-nil, is the pane's new size. Receivers reset
+	// their grid to default cells.
+	resized *grid.Size
 
 	// damage is the coalesced cell damage; cursor is the cursor state at
 	// flush time and is meaningful whenever damage is non-nil, including
@@ -54,9 +54,8 @@ type subscriber struct {
 // concurrent-safe methods are output, resize, subscribe, unsubscribe, and
 // close, each of which posts an op.
 type pipeline struct {
-	paneID string
-	ops    chan any
-	done   chan struct{} // closed when the run loop ends
+	ops  chan any
+	done chan struct{} // closed when the run loop ends
 }
 
 // Pipeline op types. Each is handled synchronously inside run.
@@ -67,11 +66,10 @@ type opUnsubscribe struct{ sub *subscriber }
 type opClose struct{ exited bool }
 
 // newPipeline starts a pipeline for a pane with a w×h grid.
-func newPipeline(paneID string, w, h int) *pipeline {
+func newPipeline(w, h int) *pipeline {
 	p := &pipeline{
-		paneID: paneID,
-		ops:    make(chan any, 64),
-		done:   make(chan struct{}),
+		ops:  make(chan any, 64),
+		done: make(chan struct{}),
 	}
 	go p.run(w, h)
 	return p
@@ -122,15 +120,15 @@ func (p *pipeline) run(w, h int) {
 	cursor := grid.Cursor{}
 	subs := make(map[*subscriber]struct{})
 
-	// The coalescing timer is armed on the first write after a flush and
-	// drained exactly once per arm, so Reset is always safe.
+	// The coalescing timer is armed on the first dirtying op after a
+	// flush — and only while someone is watching: an unwatched pane costs
+	// no snapshots, no diffs, and no wakeups. Its accumulated state is
+	// folded in by the flush a subscriber attach performs.
 	timer := time.NewTimer(flushInterval)
-	if !timer.Stop() {
-		<-timer.C
-	}
+	timer.Stop()
 	armed := false
 	arm := func() {
-		if !armed {
+		if !armed && len(subs) > 0 {
 			timer.Reset(flushInterval)
 			armed = true
 		}
@@ -150,7 +148,7 @@ func (p *pipeline) run(w, h int) {
 	// subscriber needs: reset to current size, then every non-default cell.
 	syncUpdate := func() renderUpdate {
 		sw, sh := shadow.Size()
-		return renderUpdate{resized: &[2]int{sw, sh}, damage: shadow.Snapshot(), cursor: cursor}
+		return renderUpdate{resized: &grid.Size{W: sw, H: sh}, damage: shadow.Snapshot(), cursor: cursor}
 	}
 
 	flush := func() {
@@ -207,7 +205,7 @@ func (p *pipeline) run(w, h int) {
 			// subscribers hold after applying the resize.
 			shadow = grid.New(op.w, op.h)
 			scratch = grid.New(op.w, op.h)
-			u := renderUpdate{resized: &[2]int{op.w, op.h}}
+			u := renderUpdate{resized: &grid.Size{W: op.w, H: op.h}}
 			for sub := range subs {
 				deliver(sub, u)
 			}

@@ -16,7 +16,7 @@ import (
 // startPipeline returns a pipeline that is torn down with the test.
 func startPipeline(t *testing.T, w, h int) *pipeline {
 	t.Helper()
-	p := newPipeline("%test", w, h)
+	p := newPipeline(w, h)
 	t.Cleanup(func() { p.close(false) })
 	return p
 }
@@ -50,7 +50,7 @@ func (v *pipeView) waitFor(cond func(g *grid.Grid) bool) []renderUpdate {
 			consumed = append(consumed, u)
 			v.updates = append(v.updates, u)
 			if u.resized != nil {
-				v.g = grid.New(u.resized[0], u.resized[1])
+				v.g = grid.New(u.resized.W, u.resized.H)
 			}
 			for _, patch := range u.damage {
 				v.g.Apply(patch)
@@ -125,7 +125,7 @@ func TestPipeline_LaggedSubscriberGetsFullResync(t *testing.T) {
 
 func TestPipeline_CloseExitedTellsSubscribers(t *testing.T) {
 	t.Parallel()
-	p := newPipeline("%test", 10, 2)
+	p := newPipeline(10, 2)
 	sub := p.subscribe()
 	<-sub.ch // initial sync
 
@@ -144,7 +144,7 @@ func TestPipeline_CloseExitedTellsSubscribers(t *testing.T) {
 
 func TestPipeline_CloseShutdownJustClosesChannels(t *testing.T) {
 	t.Parallel()
-	p := newPipeline("%test", 10, 2)
+	p := newPipeline(10, 2)
 	sub := p.subscribe()
 	<-sub.ch
 

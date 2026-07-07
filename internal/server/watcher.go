@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -21,36 +22,9 @@ type TmuxOptions struct {
 	Session string
 }
 
-// paneHub is the rendezvous between the watcher (which owns pane
-// lifecycles) and RPC handlers (which look panes up concurrently).
-type paneHub struct {
-	mu        sync.RWMutex
-	pipelines map[string]*pipeline
-}
-
-func newPaneHub() *paneHub {
-	return &paneHub{pipelines: make(map[string]*pipeline)}
-}
-
-func (h *paneHub) get(paneID string) *pipeline {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return h.pipelines[paneID]
-}
-
-func (h *paneHub) put(paneID string, p *pipeline) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.pipelines[paneID] = p
-}
-
-func (h *paneHub) remove(paneID string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	delete(h.pipelines, paneID)
-}
-
-// watchedPane is the watcher's bookkeeping for one live pane.
+// watchedPane is the per-pane state: the render pipeline plus the watcher's
+// bookkeeping. The pipe field is immutable after construction and safe to
+// read concurrently; the other fields belong to the watcher goroutine.
 type watchedPane struct {
 	pipe          *pipeline
 	width, height int
@@ -58,6 +32,60 @@ type watchedPane struct {
 	// seedBarrier drops output events that predate the pane's latest
 	// capture-pane seed: their bytes are already on the captured screen.
 	seedBarrier uint64
+}
+
+// paneHub is the single map of live panes, shared between the watcher
+// (which owns pane lifecycles and all watchedPane fields) and RPC handlers
+// (which only resolve a pane id to its pipeline).
+type paneHub struct {
+	mu    sync.RWMutex
+	panes map[string]*watchedPane
+}
+
+func newPaneHub() *paneHub {
+	return &paneHub{panes: make(map[string]*watchedPane)}
+}
+
+// pipe resolves a pane id to its render pipeline; nil when the pane is not
+// in the Herd. This is the RPC handlers' entry point.
+func (h *paneHub) pipe(paneID string) *pipeline {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if wp := h.panes[paneID]; wp != nil {
+		return wp.pipe
+	}
+	return nil
+}
+
+func (h *paneHub) get(paneID string) *watchedPane {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.panes[paneID]
+}
+
+func (h *paneHub) put(paneID string, wp *watchedPane) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.panes[paneID] = wp
+}
+
+// sweep removes and returns every pane not in keep.
+func (h *paneHub) sweep(keep map[string]bool) []*watchedPane {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var gone []*watchedPane
+	for id, wp := range h.panes {
+		if !keep[id] {
+			delete(h.panes, id)
+			gone = append(gone, wp)
+		}
+	}
+	return gone
+}
+
+// drain removes and returns every pane.
+func (h *paneHub) drain() []*watchedPane {
+	return h.sweep(nil)
 }
 
 // watcher mirrors one tmux session into the Server: the Registry lists its
@@ -70,10 +98,6 @@ type watcher struct {
 	registry *Registry
 	hub      *paneHub
 	log      *slog.Logger
-
-	// panes is single-goroutine state of the run loop; the hub carries the
-	// concurrent view for RPC handlers.
-	panes map[string]*watchedPane
 }
 
 // attachWatcher attaches to tmux in control mode and performs the initial
@@ -92,31 +116,28 @@ func attachWatcher(ctx context.Context, opts TmuxOptions, registry *Registry, hu
 		registry: registry,
 		hub:      hub,
 		log:      log,
-		panes:    make(map[string]*watchedPane),
 	}
 	if err := w.reconcile(ctx); err != nil {
-		for id, wp := range w.panes {
-			w.hub.remove(id)
-			wp.pipe.close(false)
-		}
-		ctl.Close() //nolint:errcheck // already failing; process cleanup only
+		w.teardown()
 		return nil, fmt.Errorf("initial pane enumeration: %w", err)
 	}
 	return w, nil
+}
+
+// teardown empties the Herd, closes every pipeline, and detaches from tmux.
+func (w *watcher) teardown() {
+	w.registry.Replace(nil)
+	for _, wp := range w.hub.drain() {
+		wp.pipe.close(false)
+	}
+	w.ctl.Close() //nolint:errcheck // teardown; the stream is already done
 }
 
 // run consumes the control-mode event stream until it ends. On return the
 // Herd is empty and every pipeline is closed; the error says why tmux went
 // away (nil when ctx ended: that is Server shutdown, not failure).
 func (w *watcher) run(ctx context.Context) error {
-	defer func() {
-		w.registry.Replace(nil)
-		for id, wp := range w.panes {
-			w.hub.remove(id)
-			wp.pipe.close(false)
-		}
-		w.ctl.Close() //nolint:errcheck // teardown; the stream is already done
-	}()
+	defer w.teardown()
 
 	for {
 		select {
@@ -124,39 +145,59 @@ func (w *watcher) run(ctx context.Context) error {
 			return nil
 		case ev, ok := <-w.ctl.Events():
 			if !ok {
-				return fmt.Errorf("tmux control stream ended")
+				return errors.New("tmux control stream ended")
 			}
-			if err := w.handle(ctx, ev); err != nil {
-				if ctx.Err() != nil {
-					return nil
+
+			// Absorb everything already queued before acting: tmux emits
+			// notification bursts (a split raises several, a resize drag
+			// a continuous stream), and one reconcile serves them all.
+			// Handling output ahead of a pending reconcile is safe: a
+			// pane the reconcile will create gets that output via its
+			// capture-pane seed instead.
+			topology, err := w.apply(ev)
+		drain:
+			for err == nil {
+				select {
+				case ev, ok = <-w.ctl.Events():
+					if !ok {
+						return errors.New("tmux control stream ended")
+					}
+					var t bool
+					t, err = w.apply(ev)
+					topology = topology || t
+				default:
+					break drain
 				}
+			}
+			if err != nil {
 				return err
+			}
+			if topology {
+				if err := w.reconcile(ctx); err != nil {
+					if ctx.Err() != nil {
+						return nil
+					}
+					return fmt.Errorf("reconcile: %w", err)
+				}
 			}
 		}
 	}
 }
 
-// exitError signals tmux deliberately closed the control client.
-type exitError struct{ reason string }
-
-func (e exitError) Error() string {
-	return strings.TrimSpace("tmux closed the control client " + e.reason)
-}
-
-func (w *watcher) handle(ctx context.Context, ev tmuxctl.Event) error {
+// apply handles one notification, reporting whether it calls for a
+// reconcile. An error means the control client is over.
+func (w *watcher) apply(ev tmuxctl.Event) (topology bool, err error) {
 	switch ev := ev.(type) {
 	case tmuxctl.OutputEvent:
-		if wp := w.panes[ev.PaneID]; wp != nil && ev.Seq >= wp.seedBarrier {
+		if wp := w.hub.get(ev.PaneID); wp != nil && ev.Seq >= wp.seedBarrier {
 			wp.pipe.output(ev.Data)
 		}
 	case tmuxctl.TopologyEvent:
-		if err := w.reconcile(ctx); err != nil {
-			return fmt.Errorf("reconcile after %q: %w", ev.Notification, err)
-		}
+		return true, nil
 	case tmuxctl.ExitEvent:
-		return exitError{reason: ev.Reason}
+		return false, fmt.Errorf("tmux closed the control client %s", strings.TrimSpace(ev.Reason))
 	}
-	return nil
+	return false, nil
 }
 
 // paneInfo is one line of the reconcile snapshot.
@@ -166,11 +207,11 @@ type paneInfo struct {
 	title         string
 }
 
-// reconcile realigns the Registry and the pipeline set with an
-// authoritative list-panes snapshot. One code path serves initial sync and
-// every topology change: create what's new, resize-and-reseed what changed,
-// close what's gone. Reconciling is idempotent, so over-triggering on
-// uninteresting notifications is safe.
+// reconcile realigns the Registry and the pane set with an authoritative
+// list-panes snapshot. One code path serves initial sync and every topology
+// change: create what's new, resize-and-reseed what changed, close what's
+// gone. Reconciling is idempotent, so over-triggering on uninteresting
+// notifications is safe.
 func (w *watcher) reconcile(ctx context.Context) error {
 	lines, err := w.ctl.Command(ctx, "list-panes", "-s", "-t", "="+w.session,
 		"-F", "#{pane_id}\t#{pane_width}\t#{pane_height}\t#{pane_title}")
@@ -188,15 +229,14 @@ func (w *watcher) reconcile(ctx context.Context) error {
 		seen[info.id] = true
 		panes = append(panes, herd.Pane{ID: info.id, Title: info.title})
 
-		wp := w.panes[info.id]
+		wp := w.hub.get(info.id)
 		switch {
 		case wp == nil:
 			// New pane: pipeline plus a seed of its current screen —
 			// which is empty for panes born after the Server attached,
 			// making them full-fidelity from their first byte.
-			wp = &watchedPane{pipe: newPipeline(info.id, info.width, info.height), width: info.width, height: info.height}
-			w.panes[info.id] = wp
-			w.hub.put(info.id, wp.pipe)
+			wp = &watchedPane{pipe: newPipeline(info.width, info.height), width: info.width, height: info.height}
+			w.hub.put(info.id, wp)
 			if err := w.seed(ctx, info.id, wp); err != nil {
 				return err
 			}
@@ -213,12 +253,8 @@ func (w *watcher) reconcile(ctx context.Context) error {
 	}
 
 	// Panes that disappeared from the snapshot have exited.
-	for id, wp := range w.panes {
-		if !seen[id] {
-			delete(w.panes, id)
-			w.hub.remove(id)
-			wp.pipe.close(true)
-		}
+	for _, wp := range w.hub.sweep(seen) {
+		wp.pipe.close(true)
 	}
 
 	// Keep tmux's own enumeration order: it is stable (window index, then
@@ -242,7 +278,7 @@ func (w *watcher) seed(ctx context.Context, paneID string, wp *watchedPane) erro
 	if err != nil {
 		return err
 	}
-	cursor, _, err := w.ctl.CommandSeq(ctx, "display-message", "-p", "-t", paneID, "#{cursor_x}\t#{cursor_y}")
+	cursor, err := w.ctl.Command(ctx, "display-message", "-p", "-t", paneID, "#{cursor_x}\t#{cursor_y}")
 	if err != nil {
 		return err
 	}

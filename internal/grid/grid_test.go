@@ -177,16 +177,3 @@ func TestRowText(t *testing.T) {
 		t.Errorf("RowText(1) = %q, want empty", got)
 	}
 }
-
-func TestCopyInto_ProducesIndependentCopy(t *testing.T) {
-	src := New(2, 1)
-	src.Set(0, 0, Cell{Content: "A", Width: 1})
-
-	var dst Grid
-	src.CopyInto(&dst)
-	src.Set(0, 0, Cell{Content: "B", Width: 1})
-
-	if got := dst.At(0, 0).Content; got != "A" {
-		t.Errorf("copy content = %q after mutating source, want %q", got, "A")
-	}
-}

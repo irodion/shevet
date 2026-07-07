@@ -61,12 +61,11 @@ type Model struct {
 	loaded bool
 	err    error
 
-	// The watched Pane, once one is picked from the Herd.
-	watching   *herd.Pane
-	stream     PaneStream
-	pane       *grid.Grid
-	cursor     grid.Cursor
-	paneExited bool
+	// The watched Pane, once one is picked from the Herd; view folds the
+	// render stream into the local grid.
+	watching *herd.Pane
+	stream   PaneStream
+	view     *client.PaneView
 }
 
 // New returns a dashboard Model that will populate itself from conn.
@@ -163,11 +162,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case watchStartedMsg:
 		m.stream = msg.stream
+		m.view = client.NewPaneView()
 		return m, recvCmd(m.stream)
 
 	case paneUpdateMsg:
-		m.applyUpdate(client.PaneUpdate(msg))
-		if m.paneExited {
+		m.view.Apply(client.PaneUpdate(msg))
+		if m.view.Exited {
 			return m, nil // stream is over; the Server sends nothing after exited
 		}
 		return m, recvCmd(m.stream)
@@ -176,25 +176,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = msg.err
 	}
 	return m, nil
-}
-
-// applyUpdate folds one stream update into the local grid state.
-func (m *Model) applyUpdate(u client.PaneUpdate) {
-	switch {
-	case u.Exited:
-		m.paneExited = true
-	case u.Resized != nil:
-		// A resize resets content; the following damage re-establishes it.
-		m.pane = grid.New(u.Resized[0], u.Resized[1])
-	case u.Damage != nil:
-		if m.pane == nil {
-			return // protocol promises a resize first; tolerate its absence
-		}
-		for _, p := range u.Damage {
-			m.pane.Apply(p)
-		}
-		m.cursor = u.Cursor
-	}
 }
 
 // Styles are package-level for now; a theme arrives with the grid widget.
@@ -213,13 +194,13 @@ func (m Model) View() tea.View {
 		body = statusStyle.Render("Connecting to Server...")
 	case m.err != nil:
 		body = errorStyle.Render("Cannot reach Server: " + m.err.Error())
-	case m.paneExited:
+	case m.view != nil && m.view.Exited:
 		body = statusStyle.Render(fmt.Sprintf("Pane %s exited", m.watching.ID))
-	case m.watching != nil && m.pane != nil:
+	case m.view != nil && sized(m.view.Grid):
 		// The live Pane, full-screen and read-only. Content larger than
 		// the terminal is clipped by the renderer; resize-on-focus is the
 		// dashboard slice's business.
-		view := tea.NewView(renderPane(m.pane, m.cursor))
+		view := tea.NewView(renderPane(m.view.Grid, m.view.Cursor))
 		view.AltScreen = true
 		return view
 	case m.watching != nil:
@@ -238,6 +219,13 @@ func (m Model) View() tea.View {
 	view := tea.NewView(b.String())
 	view.AltScreen = true
 	return view
+}
+
+// sized reports whether the stream's initial resize has arrived and the
+// grid is renderable.
+func sized(g *grid.Grid) bool {
+	w, _ := g.Size()
+	return w > 0
 }
 
 // renderHerdSummary renders the Herd as a count plus one line per Pane.

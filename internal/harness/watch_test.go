@@ -13,20 +13,18 @@ import (
 	"github.com/irodion/shevet/internal/testutil"
 )
 
-// paneView consumes a WatchPane stream and folds it into a local grid — the
-// e2e test client's model of what the Client renders.
+// paneView consumes a WatchPane stream through the shared client-side fold
+// (client.PaneView) — the e2e test client sees exactly what the Client
+// renders — while recording the damage batches for wire assertions.
 type paneView struct {
 	t     *testing.T
 	watch *client.PaneWatch
-
-	grid   *grid.Grid
-	cursor grid.Cursor
+	view  *client.PaneView
 
 	// batches records every damage batch after the initial sync, for the
 	// wire-carries-damage-not-frames assertions.
 	batches [][]grid.CellPatch
 	synced  bool
-	exited  bool
 }
 
 // watchPane opens the render stream for a pane, bounded by the test's
@@ -40,7 +38,7 @@ func watchPane(t *testing.T, c *client.Client, paneID string) *paneView {
 	if err != nil {
 		t.Fatalf("WatchPane(%s): %v", paneID, err)
 	}
-	return &paneView{t: t, watch: watch, grid: grid.New(0, 0)}
+	return &paneView{t: t, watch: watch, view: client.NewPaneView()}
 }
 
 // step folds the next stream update into the view.
@@ -50,21 +48,13 @@ func (v *paneView) step() {
 	if err != nil {
 		v.t.Fatalf("Recv: %v (grid so far:\n%s)", err, v.dump())
 	}
-	switch {
-	case u.Exited:
-		v.exited = true
-	case u.Resized != nil:
-		v.grid = grid.New(u.Resized[0], u.Resized[1])
-	case u.Damage != nil:
+	if u.Damage != nil {
 		if v.synced {
 			v.batches = append(v.batches, u.Damage)
 		}
-		for _, p := range u.Damage {
-			v.grid.Apply(p)
-		}
-		v.cursor = u.Cursor
 		v.synced = true
 	}
+	v.view.Apply(u)
 }
 
 // waitFor steps the stream until the grid's text contains want. The stream
@@ -79,9 +69,9 @@ func (v *paneView) waitFor(want string) {
 // dump renders the grid's text content, one line per row.
 func (v *paneView) dump() string {
 	var b strings.Builder
-	_, h := v.grid.Size()
+	_, h := v.view.Grid.Size()
 	for y := 0; y < h; y++ {
-		b.WriteString(v.grid.RowText(y))
+		b.WriteString(v.view.Grid.RowText(y))
 		b.WriteByte('\n')
 	}
 	return b.String()
@@ -112,26 +102,26 @@ func TestWatchPane_LiveAgent(t *testing.T) {
 
 	// The final grid, row by row.
 	for row, want := range []string{"plain line", "ORANGE tail", "wide 你好 cells", "done >"} {
-		if got := view.grid.RowText(row); got != want {
+		if got := view.view.Grid.RowText(row); got != want {
 			t.Errorf("grid row %d = %q, want %q", row, got, want)
 		}
 	}
 
 	// Styling and geometry survived the wire: truecolor on the SGR run,
 	// default after reset, wide cells with their spacers.
-	if c := view.grid.At(0, 1); c.FG != grid.RGB(255, 100, 0) {
+	if c := view.view.Grid.At(0, 1); c.FG != grid.RGB(255, 100, 0) {
 		t.Errorf("ORANGE cell fg = %#x, want truecolor rgb(255,100,0)", c.FG)
 	}
-	if c := view.grid.At(7, 1); c.FG != 0 {
+	if c := view.view.Grid.At(7, 1); c.FG != 0 {
 		t.Errorf("post-reset cell fg = %#x, want default", c.FG)
 	}
-	if c := view.grid.At(5, 2); c.Content != "你" || c.Width != 2 {
+	if c := view.view.Grid.At(5, 2); c.Content != "你" || c.Width != 2 {
 		t.Errorf("CJK cell = %+v, want 你 width 2", c)
 	}
 
 	// The cursor parks right after the prompt, visible.
-	if want := (grid.Cursor{X: 7, Y: 3}); view.cursor != want {
-		t.Errorf("cursor = %+v, want %+v", view.cursor, want)
+	if want := (grid.Cursor{X: 7, Y: 3}); view.view.Cursor != want {
+		t.Errorf("cursor = %+v, want %+v", view.view.Cursor, want)
 	}
 
 	// Damage, never full frames: drive the agent one step and verify the
@@ -140,7 +130,7 @@ func TestWatchPane_LiveAgent(t *testing.T) {
 	h.Tmux.SendLine(t, pane, "go")
 	view.waitFor("bye >")
 
-	w, hgt := view.grid.Size()
+	w, hgt := view.view.Grid.Size()
 	if len(view.batches) == 0 {
 		t.Fatal("no incremental damage batches arrived")
 	}
@@ -179,7 +169,7 @@ func TestWatchPane_PaneExitEndsStream(t *testing.T) {
 	view.step() // initial sync damage
 
 	h.Tmux.Run(t, "kill-pane", "-t", pane)
-	for !view.exited {
+	for !view.view.Exited {
 		view.step()
 	}
 }
@@ -195,7 +185,7 @@ func TestWatchPane_TwoSubscribersSeeTheSamePane(t *testing.T) {
 	a.waitFor("ready >")
 	b.waitFor("ready >")
 
-	if got, want := a.grid.RowText(0), b.grid.RowText(0); got != want {
+	if got, want := a.view.Grid.RowText(0), b.view.Grid.RowText(0); got != want {
 		t.Errorf("subscribers disagree: %q vs %q", got, want)
 	}
 }

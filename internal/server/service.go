@@ -39,23 +39,33 @@ func (s *herdService) ListPanes(ctx context.Context, req *shevetv1.ListPanesRequ
 // WatchPane subscribes the caller to a Pane's render pipeline and relays
 // updates until the Pane exits, the Client hangs up, or the Server stops.
 func (s *herdService) WatchPane(req *shevetv1.WatchPaneRequest, stream shevetv1.HerdService_WatchPaneServer) error {
-	pipe := s.hub.get(req.GetPaneId())
+	pipe := s.hub.pipe(req.GetPaneId())
 	if pipe == nil {
 		return status.Errorf(codes.NotFound, "no pane %q in the Herd", req.GetPaneId())
+	}
+
+	// relay forwards one queued update, reporting whether the stream is
+	// over (channel closed, send failure, or the terminal exited update).
+	relay := func(u renderUpdate, ok bool) (stop bool, err error) {
+		if !ok {
+			return true, nil // pane closed or Server shutting down
+		}
+		if err := sendUpdate(stream, u); err != nil {
+			return true, err
+		}
+		return u.exited, nil
 	}
 
 	sub := pipe.subscribe()
 	for {
 		select {
 		case u, ok := <-sub.ch:
-			if !ok {
-				return nil // pane closed or Server shutting down
-			}
-			if err := sendUpdate(stream, u); err != nil {
+			stop, err := relay(u, ok)
+			if err != nil {
 				pipe.unsubscribe(sub)
 				return err
 			}
-			if u.exited {
+			if stop {
 				return nil
 			}
 		case <-stream.Context().Done():
@@ -68,14 +78,8 @@ func (s *herdService) WatchPane(req *shevetv1.WatchPaneRequest, stream shevetv1.
 			for {
 				select {
 				case u, ok := <-sub.ch:
-					if !ok {
-						return nil
-					}
-					if err := sendUpdate(stream, u); err != nil {
+					if stop, err := relay(u, ok); err != nil || stop {
 						return err
-					}
-					if u.exited {
-						return nil
 					}
 				default:
 					return nil
@@ -90,21 +94,16 @@ func (s *herdService) WatchPane(req *shevetv1.WatchPaneRequest, stream shevetv1.
 func sendUpdate(stream shevetv1.HerdService_WatchPaneServer, u renderUpdate) error {
 	if u.resized != nil {
 		msg := &shevetv1.PaneUpdate{Update: &shevetv1.PaneUpdate_Resized{
-			Resized: &shevetv1.PaneResized{Width: uint32(u.resized[0]), Height: uint32(u.resized[1])},
+			Resized: &shevetv1.PaneResized{Width: uint32(u.resized.W), Height: uint32(u.resized.H)},
 		}}
 		if err := stream.Send(msg); err != nil {
 			return err
 		}
 	}
 	if u.damage != nil {
-		damage := &shevetv1.CellDamage{
-			Cells:  make([]*shevetv1.CellPatch, 0, len(u.damage)),
-			Cursor: wire.CursorToProto(u.cursor),
-		}
-		for _, p := range u.damage {
-			damage.Cells = append(damage.Cells, wire.PatchToProto(p))
-		}
-		msg := &shevetv1.PaneUpdate{Update: &shevetv1.PaneUpdate_Damage{Damage: damage}}
+		msg := &shevetv1.PaneUpdate{Update: &shevetv1.PaneUpdate_Damage{
+			Damage: wire.DamageToProto(u.damage, u.cursor),
+		}}
 		if err := stream.Send(msg); err != nil {
 			return err
 		}

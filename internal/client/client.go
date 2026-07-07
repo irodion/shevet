@@ -66,9 +66,9 @@ func (c *Client) ListPanes(ctx context.Context) ([]herd.Pane, error) {
 // field groups is meaningful per update: a resize, a damage batch (cells
 // plus cursor — cells may be empty for cursor-only movement), or exited.
 type PaneUpdate struct {
-	// Resized, when non-nil, is the Pane's new {width, height}; the
-	// receiver's grid resets to default cells.
-	Resized *[2]int
+	// Resized, when non-nil, is the Pane's new size; the receiver's grid
+	// resets to default cells.
+	Resized *grid.Size
 
 	// Damage, when non-nil, is a batch of cell patches; Cursor is the
 	// cursor state after applying it.
@@ -77,6 +77,36 @@ type PaneUpdate struct {
 
 	// Exited reports the Pane left the Herd; the stream ends after it.
 	Exited bool
+}
+
+// PaneView follows a Pane's render stream: it folds PaneUpdates into a
+// local grid, realizing the protocol contract in one place — a resize
+// resets content, damage re-establishes it, exited is terminal. The TUI's
+// Pane widget and the test clients all view a Pane through this type.
+type PaneView struct {
+	Grid   *grid.Grid
+	Cursor grid.Cursor
+	Exited bool
+}
+
+// NewPaneView returns an empty view, ready for the stream's initial resize.
+func NewPaneView() *PaneView {
+	return &PaneView{Grid: grid.New(0, 0)}
+}
+
+// Apply folds one stream update into the view.
+func (v *PaneView) Apply(u PaneUpdate) {
+	switch {
+	case u.Exited:
+		v.Exited = true
+	case u.Resized != nil:
+		v.Grid = grid.New(u.Resized.W, u.Resized.H)
+	case u.Damage != nil:
+		for _, p := range u.Damage {
+			v.Grid.Apply(p)
+		}
+		v.Cursor = u.Cursor
+	}
 }
 
 // PaneWatch is a live render stream for one Pane. Receive with Recv until
@@ -106,13 +136,10 @@ func (w *PaneWatch) Recv() (PaneUpdate, error) {
 
 	switch u := msg.GetUpdate().(type) {
 	case *shevetv1.PaneUpdate_Resized:
-		return PaneUpdate{Resized: &[2]int{int(u.Resized.GetWidth()), int(u.Resized.GetHeight())}}, nil
+		return PaneUpdate{Resized: &grid.Size{W: int(u.Resized.GetWidth()), H: int(u.Resized.GetHeight())}}, nil
 	case *shevetv1.PaneUpdate_Damage:
-		damage := make([]grid.CellPatch, 0, len(u.Damage.GetCells()))
-		for _, p := range u.Damage.GetCells() {
-			damage = append(damage, wire.PatchFromProto(p))
-		}
-		return PaneUpdate{Damage: damage, Cursor: wire.CursorFromProto(u.Damage.GetCursor())}, nil
+		damage, cursor := wire.DamageFromProto(u.Damage)
+		return PaneUpdate{Damage: damage, Cursor: cursor}, nil
 	case *shevetv1.PaneUpdate_Exited:
 		return PaneUpdate{Exited: true}, nil
 	default:

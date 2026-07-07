@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/irodion/shevet/internal/grid"
+	"github.com/irodion/shevet/internal/client"
 	"github.com/irodion/shevet/internal/harness"
 	"github.com/irodion/shevet/internal/server"
 	"github.com/irodion/shevet/internal/testutil"
@@ -45,22 +45,17 @@ func TestServe_SeedsPreexistingPaneContent(t *testing.T) {
 		t.Fatalf("WatchPane: %v", err)
 	}
 
-	g := grid.New(0, 0)
-	for g.RowText(0) != "green seeded" {
+	v := client.NewPaneView()
+	for v.Grid.RowText(0) != "green seeded" {
 		u, err := watch.Recv()
 		if err != nil {
-			t.Fatalf("Recv: %v (row so far %q)", err, g.RowText(0))
+			t.Fatalf("Recv: %v (row so far %q)", err, v.Grid.RowText(0))
 		}
-		if u.Resized != nil {
-			g = grid.New(u.Resized[0], u.Resized[1])
-		}
-		for _, p := range u.Damage {
-			g.Apply(p)
-		}
+		v.Apply(u)
 	}
 
 	// Styling survives the seed: capture-pane -e carries the SGR codes.
-	if cell := g.At(0, 0); cell.FG == 0 {
+	if cell := v.Grid.At(0, 0); cell.FG == 0 {
 		t.Errorf("seeded cell = %+v, want a green foreground", cell)
 	}
 }

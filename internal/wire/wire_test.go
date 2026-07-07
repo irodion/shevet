@@ -34,6 +34,22 @@ func TestPatch_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestDamage_RoundTrip(t *testing.T) {
+	cells := []grid.CellPatch{
+		{X: 1, Y: 2, Cell: grid.Cell{Content: "a", Width: 1, FG: grid.RGB(1, 2, 3)}},
+		{X: 3, Y: 2, Cell: grid.Cell{}},
+	}
+	cursor := grid.Cursor{X: 4, Y: 2, Hidden: true}
+
+	gotCells, gotCursor := DamageFromProto(DamageToProto(cells, cursor))
+	if len(gotCells) != len(cells) || gotCells[0] != cells[0] || gotCells[1] != cells[1] {
+		t.Errorf("round trip mangled the cells: got %+v, want %+v", gotCells, cells)
+	}
+	if gotCursor != cursor {
+		t.Errorf("round trip mangled the cursor: got %+v, want %+v", gotCursor, cursor)
+	}
+}
+
 func TestCursor_RoundTrip(t *testing.T) {
 	in := grid.Cursor{X: 12, Y: 5, Hidden: true}
 
