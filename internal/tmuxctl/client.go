@@ -54,8 +54,9 @@ type Client struct {
 	quit      chan struct{} // closed by Close: stop delivering events
 	closeOnce sync.Once
 
-	mu      sync.Mutex
-	pending []chan reply // FIFO: tmux answers commands in send order
+	mu        sync.Mutex
+	pending   []chan reply // FIFO: tmux answers commands in send order
+	guardSeen bool         // the attach guard reply has been consumed
 }
 
 // Attach starts a control-mode tmux client attached to the session and
@@ -223,12 +224,20 @@ func (c *Client) readLoop(stdout io.Reader) {
 	close(c.events)
 }
 
-// completeReply hands a finished reply to the oldest waiting command. tmux
-// sends one unsolicited reply on attach (the guard block); with no waiter it
-// is dropped by design.
+// completeReply hands a finished reply to the oldest waiting command.
+//
+// The very first reply block is never a command's: it is the guard block
+// tmux emits for the attach command itself. It must be discarded by
+// position, not by whether a waiter exists — a command sent quickly after
+// attach can be pending before the guard arrives, and matching the guard to
+// it would shift every reply to the wrong command from then on.
 func (c *Client) completeReply(r reply) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if !c.guardSeen {
+		c.guardSeen = true
+		return
+	}
 	if len(c.pending) == 0 {
 		return
 	}

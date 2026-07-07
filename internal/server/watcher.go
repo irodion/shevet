@@ -76,22 +76,33 @@ type watcher struct {
 	panes map[string]*watchedPane
 }
 
-// attachWatcher attaches to tmux in control mode. The returned watcher's
-// run loop mirrors the session until ctx ends or tmux hangs up; a failed
-// attach (no server, no session) is reported here, synchronously.
+// attachWatcher attaches to tmux in control mode and performs the initial
+// pane enumeration. Both a failed attach (no server, no session) and a
+// failed first reconcile are reported here, synchronously — and because the
+// first reconcile completes before this returns, a Server that serves RPCs
+// only afterwards presents a populated Herd from its very first response.
 func attachWatcher(ctx context.Context, opts TmuxOptions, registry *Registry, hub *paneHub, log *slog.Logger) (*watcher, error) {
 	ctl, err := tmuxctl.Attach(ctx, tmuxctl.Options{Socket: opts.Socket, Session: opts.Session})
 	if err != nil {
 		return nil, err
 	}
-	return &watcher{
+	w := &watcher{
 		ctl:      ctl,
 		session:  opts.Session,
 		registry: registry,
 		hub:      hub,
 		log:      log,
 		panes:    make(map[string]*watchedPane),
-	}, nil
+	}
+	if err := w.reconcile(ctx); err != nil {
+		for id, wp := range w.panes {
+			w.hub.remove(id)
+			wp.pipe.close(false)
+		}
+		ctl.Close() //nolint:errcheck // already failing; process cleanup only
+		return nil, fmt.Errorf("initial pane enumeration: %w", err)
+	}
+	return w, nil
 }
 
 // run consumes the control-mode event stream until it ends. On return the
@@ -106,10 +117,6 @@ func (w *watcher) run(ctx context.Context) error {
 		}
 		w.ctl.Close() //nolint:errcheck // teardown; the stream is already done
 	}()
-
-	if err := w.reconcile(ctx); err != nil {
-		return fmt.Errorf("initial pane enumeration: %w", err)
-	}
 
 	for {
 		select {
