@@ -57,6 +57,7 @@ type Client struct {
 	mu        sync.Mutex
 	pending   []chan reply // FIFO: tmux answers commands in send order
 	guardSeen bool         // the attach guard reply has been consumed
+	guardErr  string       // the guard's text when it was an %error: why the attach failed
 }
 
 // Attach starts a control-mode tmux client attached to the session and
@@ -236,6 +237,12 @@ func (c *Client) completeReply(r reply) {
 	defer c.mu.Unlock()
 	if !c.guardSeen {
 		c.guardSeen = true
+		// A failed attach (no server, no such session) reports its reason
+		// as an %error guard on stdout — nothing goes to stderr. Keep the
+		// text so the exit error can say why instead of "exit status 1".
+		if r.isErr {
+			c.guardErr = strings.Join(r.lines, " ")
+		}
 		return
 	}
 	if len(c.pending) == 0 {
@@ -254,12 +261,14 @@ func (c *Client) streamErr() error {
 	return c.err
 }
 
-// exitError condenses scanner and process state into one error.
+// exitError condenses scanner, guard, and process state into one error.
 func (c *Client) exitError(scanErr, waitErr error) error {
 	msg := strings.TrimSpace(c.stderr.String())
 	switch {
 	case scanErr != nil:
 		return fmt.Errorf("tmuxctl: control stream: %w", scanErr)
+	case c.guardErr != "":
+		return fmt.Errorf("tmuxctl: tmux: %s", c.guardErr)
 	case waitErr != nil && msg != "":
 		return fmt.Errorf("tmuxctl: tmux exited: %v: %s", waitErr, msg)
 	case waitErr != nil:

@@ -44,6 +44,11 @@ func TestAttach_FailsForMissingSession(t *testing.T) {
 	if err == nil {
 		t.Fatal("Attach to a missing session succeeded, want error")
 	}
+	// tmux states the reason in an %error guard block on stdout; the error
+	// must relay it, not just "exit status 1".
+	if !strings.Contains(err.Error(), "no-such-session") {
+		t.Errorf("error %q does not relay tmux's reason (the session name)", err)
+	}
 }
 
 func TestAttach_FailsWithoutServer(t *testing.T) {
