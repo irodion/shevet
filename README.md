@@ -4,8 +4,9 @@ A single-binary Go system that lets one developer monitor and drive AI
 execution agents (Claude Code and others) running inside tmux on machines they
 own, through a local terminal dashboard.
 
-> **Status:** design phase. This repository currently holds the architecture,
-> the decision record, and the research that backs both. No application code yet.
+> **Status:** early development. The walking skeleton is in place — `shevet
+> serve` and `shevet connect` talk gRPC over a local unix socket. The roadmap
+> lives in the issue tracker (PRDs [#1](https://github.com/irodion/shevet/issues/1)–[#4](https://github.com/irodion/shevet/issues/4)).
 
 ## What it does
 
@@ -32,6 +33,24 @@ alerted the moment one finishes or blocks — all from a single terminal.
 
 Start with `ARCHITECTURE.md`, then read `docs/adr/` for the reasoning behind
 each non-obvious choice.
+
+## Development
+
+Requires Go (see `go.mod`); protobuf tooling only when changing `.proto` files.
+
+```sh
+make build   # build ./bin/shevet (CGO-free)
+make test    # all tests, race detector on
+make lint    # gofmt + go vet + staticcheck
+make cross   # verify every supported GOOS/GOARCH builds
+```
+
+Try the skeleton locally:
+
+```sh
+./bin/shevet serve --socket /tmp/shevet.sock &
+./bin/shevet connect --socket /tmp/shevet.sock   # q to quit
+```
 
 ## License
 

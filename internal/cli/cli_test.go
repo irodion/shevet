@@ -1,0 +1,108 @@
+package cli
+
+import (
+	"context"
+	"strings"
+	"testing"
+)
+
+// run invokes the CLI with captured output.
+func run(t *testing.T, args ...string) (code int, stdout, stderr string) {
+	t.Helper()
+	var out, errOut strings.Builder
+	code = Run(context.Background(), args, &out, &errOut)
+	return code, out.String(), errOut.String()
+}
+
+func TestRun_NoArgsPrintsUsage(t *testing.T) {
+	code, _, stderr := run(t)
+	if code != exitUsage {
+		t.Errorf("exit code = %d, want %d", code, exitUsage)
+	}
+	if !strings.Contains(stderr, "Usage:") {
+		t.Errorf("stderr does not contain usage:\n%s", stderr)
+	}
+}
+
+func TestRun_UnknownCommand(t *testing.T) {
+	code, _, stderr := run(t, "frobnicate")
+	if code != exitUsage {
+		t.Errorf("exit code = %d, want %d", code, exitUsage)
+	}
+	if !strings.Contains(stderr, `unknown command "frobnicate"`) {
+		t.Errorf("stderr does not name the unknown command:\n%s", stderr)
+	}
+}
+
+func TestRun_HelpGoesToStdout(t *testing.T) {
+	code, stdout, _ := run(t, "help")
+	if code != exitOK {
+		t.Errorf("exit code = %d, want %d", code, exitOK)
+	}
+	if !strings.Contains(stdout, "serve") || !strings.Contains(stdout, "connect") {
+		t.Errorf("help does not list core commands:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "_proxy") {
+		t.Errorf("help leaks the hidden _proxy command:\n%s", stdout)
+	}
+}
+
+func TestRun_Version(t *testing.T) {
+	code, stdout, _ := run(t, "version")
+	if code != exitOK {
+		t.Errorf("exit code = %d, want %d", code, exitOK)
+	}
+	if !strings.Contains(stdout, "shevet dev") {
+		t.Errorf("version output unexpected:\n%s", stdout)
+	}
+}
+
+func TestConnect_RequiresTarget(t *testing.T) {
+	code, _, stderr := run(t, "connect")
+	if code != exitUsage {
+		t.Errorf("exit code = %d, want %d", code, exitUsage)
+	}
+	if !strings.Contains(stderr, "--socket") {
+		t.Errorf("stderr does not mention --socket:\n%s", stderr)
+	}
+}
+
+func TestConnect_HostNotImplementedYet(t *testing.T) {
+	code, _, stderr := run(t, "connect", "somehost")
+	if code != exitError {
+		t.Errorf("exit code = %d, want %d", code, exitError)
+	}
+	if !strings.Contains(stderr, "not implemented") {
+		t.Errorf("stderr does not explain the missing SSH transport:\n%s", stderr)
+	}
+}
+
+func TestConnect_RejectsHostPlusSocket(t *testing.T) {
+	code, _, stderr := run(t, "connect", "-socket", "/tmp/x.sock", "somehost")
+	if code != exitUsage {
+		t.Errorf("exit code = %d, want %d", code, exitUsage)
+	}
+	if !strings.Contains(stderr, "mutually exclusive") {
+		t.Errorf("stderr does not explain exclusivity:\n%s", stderr)
+	}
+}
+
+func TestServe_RejectsPositionalArgs(t *testing.T) {
+	code, _, stderr := run(t, "serve", "extra")
+	if code != exitUsage {
+		t.Errorf("exit code = %d, want %d", code, exitUsage)
+	}
+	if !strings.Contains(stderr, "unexpected argument") {
+		t.Errorf("stderr does not flag the argument:\n%s", stderr)
+	}
+}
+
+func TestProxy_NotImplemented(t *testing.T) {
+	code, _, stderr := run(t, "_proxy")
+	if code != exitError {
+		t.Errorf("exit code = %d, want %d", code, exitError)
+	}
+	if !strings.Contains(stderr, "not implemented") {
+		t.Errorf("stderr does not explain the stub:\n%s", stderr)
+	}
+}
