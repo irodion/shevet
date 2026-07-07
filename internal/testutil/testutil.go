@@ -8,7 +8,33 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
+
+// WaitTimeout bounds every cross-process wait in the test suite. Polling is
+// legitimate only at a process boundary (tmux, spawned binaries); in-process
+// waits should be synchronous by construction.
+const WaitTimeout = 10 * time.Second
+
+// pollInterval is how often Eventually re-checks its condition.
+const pollInterval = 20 * time.Millisecond
+
+// Eventually polls cond until it reports done or WaitTimeout elapses, then
+// fails the test naming what was awaited and the last observed state.
+func Eventually(t *testing.T, desc string, cond func() (done bool, state string)) {
+	t.Helper()
+	deadline := time.Now().Add(WaitTimeout)
+	for {
+		done, state := cond()
+		if done {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s; last state:\n%s", desc, state)
+		}
+		time.Sleep(pollInterval)
+	}
+}
 
 // ShortDir returns a fresh temp directory with a short absolute path,
 // cleaned up with the test.

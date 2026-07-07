@@ -1,7 +1,7 @@
 package scriptedagent
 
 import (
-	"bytes"
+	"bufio"
 	"io"
 	"strings"
 	"testing"
@@ -58,8 +58,8 @@ exit 7`)
 		done <- result{code, err}
 	}()
 
-	out := &lineReader{r: outR}
-	if got := out.line(t); got != "before" {
+	out := bufio.NewScanner(outR)
+	if got := nextLine(t, out); got != "before" {
 		t.Fatalf("first line = %q, want %q", got, "before")
 	}
 
@@ -68,7 +68,7 @@ exit 7`)
 	if _, err := inW.Write([]byte("go\n")); err != nil {
 		t.Fatalf("write input: %v", err)
 	}
-	if got := out.line(t); got != "after" {
+	if got := nextLine(t, out); got != "after" {
 		t.Fatalf("second line = %q, want %q", got, "after")
 	}
 
@@ -91,12 +91,10 @@ func TestRun_AwaitLineFailsWhenStdinCloses(t *testing.T) {
 	inR, inW := io.Pipe()
 	inW.Close() // driver goes away
 
-	code, err := s.Run(inR, io.Discard)
-	if err == nil {
+	// The code is meaningless on error (the caller owns failure exit codes);
+	// only the error matters.
+	if _, err := s.Run(inR, io.Discard); err == nil {
 		t.Fatal("Run succeeded with closed stdin at await-line, want error")
-	}
-	if code == 0 {
-		t.Error("exit code = 0 for a failed await-line, want non-zero")
 	}
 }
 
@@ -143,32 +141,13 @@ func TestParse_ReportsLineNumbers(t *testing.T) {
 	}
 }
 
-// lineReader reads newline-terminated lines from a pipe for assertions.
-// Reads block on the pipe, so no polling; the deadline guards a wedged agent.
-type lineReader struct {
-	r   io.Reader
-	buf []byte
-}
-
-func (l *lineReader) line(t *testing.T) string {
+// nextLine reads the next newline-terminated line from the scanner; reads
+// block on the pipe, so a misbehaving agent hangs into the go test timeout
+// rather than being masked by a shorter local deadline.
+func nextLine(t *testing.T, sc *bufio.Scanner) string {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if i := bytes.IndexByte(l.buf, '\n'); i >= 0 {
-			line := string(l.buf[:i])
-			l.buf = l.buf[i+1:]
-			return line
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("no line within deadline; buffered %q", l.buf)
-		}
-		chunk := make([]byte, 256)
-		n, err := l.r.Read(chunk)
-		if n > 0 {
-			l.buf = append(l.buf, chunk[:n]...)
-		}
-		if err != nil && bytes.IndexByte(l.buf, '\n') < 0 {
-			t.Fatalf("stream ended without a full line; buffered %q (err %v)", l.buf, err)
-		}
+	if !sc.Scan() {
+		t.Fatalf("stream ended without a full line (err %v)", sc.Err())
 	}
+	return sc.Text()
 }

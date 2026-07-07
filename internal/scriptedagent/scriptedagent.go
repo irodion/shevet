@@ -33,8 +33,8 @@ const (
 	opExit                // exit <code>: stop with the given exit code
 )
 
-// Step is one parsed script instruction.
-type Step struct {
+// step is one parsed script instruction.
+type step struct {
 	op   op
 	text string        // opPrint, opPrompt
 	dur  time.Duration // opSleep
@@ -43,14 +43,14 @@ type Step struct {
 
 // Script is a parsed scripted-agent program.
 type Script struct {
-	steps []Step
+	steps []step
 }
 
 // Parse reads the line-based script vocabulary. Blank lines and lines
 // starting with '#' are ignored. It rejects unknown ops and malformed
 // arguments so a typo fails the test loudly instead of desynchronizing it.
 func Parse(r io.Reader) (*Script, error) {
-	var steps []Step
+	var steps []step
 
 	scanner := bufio.NewScanner(r)
 	lineNo := 0
@@ -77,64 +77,62 @@ func Parse(r io.Reader) (*Script, error) {
 	return &Script{steps: steps}, nil
 }
 
-func parseStep(verb, arg string) (Step, error) {
+// parseStep parses one instruction. Text ops take their argument verbatim;
+// for the others, surrounding whitespace is insignificant.
+func parseStep(verb, arg string) (step, error) {
 	switch verb {
 	case "print":
-		return Step{op: opPrint, text: arg}, nil
+		return step{op: opPrint, text: arg}, nil
 	case "prompt":
-		return Step{op: opPrompt, text: arg}, nil
-	}
-
-	// For the non-text ops, trailing whitespace is insignificant.
-	arg = strings.TrimSpace(arg)
-	switch verb {
+		return step{op: opPrompt, text: arg}, nil
 	case "await-line":
-		if arg != "" {
-			return Step{}, fmt.Errorf("await-line takes no argument, got %q", arg)
+		if strings.TrimSpace(arg) != "" {
+			return step{}, fmt.Errorf("await-line takes no argument, got %q", arg)
 		}
-		return Step{op: opAwaitLine}, nil
+		return step{op: opAwaitLine}, nil
 	case "sleep":
-		dur, err := time.ParseDuration(arg)
+		dur, err := time.ParseDuration(strings.TrimSpace(arg))
 		if err != nil {
-			return Step{}, fmt.Errorf("sleep: %w", err)
+			return step{}, fmt.Errorf("sleep: %w", err)
 		}
-		return Step{op: opSleep, dur: dur}, nil
+		return step{op: opSleep, dur: dur}, nil
 	case "exit":
-		code, err := strconv.Atoi(arg)
+		code, err := strconv.Atoi(strings.TrimSpace(arg))
 		if err != nil {
-			return Step{}, fmt.Errorf("exit: %w", err)
+			return step{}, fmt.Errorf("exit: %w", err)
 		}
-		return Step{op: opExit, code: code}, nil
+		return step{op: opExit, code: code}, nil
 	default:
-		return Step{}, fmt.Errorf("unknown op %q", verb)
+		return step{}, fmt.Errorf("unknown op %q", verb)
 	}
 }
 
 // Run executes the script against the given streams and returns the exit
 // code the process should terminate with: the argument of the first `exit`
-// step, or 0 when the script ends without one. A read failure on stdin
-// (e.g. the driving test went away mid `await-line`) returns an error.
+// step, or 0 when the script ends without one. On error — e.g. stdin closed
+// mid `await-line` because the driving test went away — the code is
+// meaningless; the caller owns the process exit code for failures.
 func (s *Script) Run(stdin io.Reader, stdout io.Writer) (int, error) {
 	in := bufio.NewReader(stdin)
 
-	for _, step := range s.steps {
-		switch step.op {
+	for _, st := range s.steps {
+		switch st.op {
 		case opPrint:
-			if _, err := fmt.Fprintln(stdout, step.text); err != nil {
-				return 1, fmt.Errorf("print: %w", err)
+			if _, err := fmt.Fprintln(stdout, st.text); err != nil {
+				return 0, fmt.Errorf("print: %w", err)
 			}
 		case opPrompt:
-			if _, err := io.WriteString(stdout, step.text); err != nil {
-				return 1, fmt.Errorf("prompt: %w", err)
+			if _, err := io.WriteString(stdout, st.text); err != nil {
+				return 0, fmt.Errorf("prompt: %w", err)
 			}
 		case opAwaitLine:
 			if _, err := in.ReadString('\n'); err != nil {
-				return 1, fmt.Errorf("await-line: %w", err)
+				return 0, fmt.Errorf("await-line: %w", err)
 			}
 		case opSleep:
-			time.Sleep(step.dur)
+			time.Sleep(st.dur)
 		case opExit:
-			return step.code, nil
+			return st.code, nil
 		}
 	}
 	return 0, nil

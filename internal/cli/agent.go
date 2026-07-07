@@ -43,6 +43,7 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 	code, err := script.Run(os.Stdin, stdout)
 	if err != nil {
 		fmt.Fprintf(stderr, "shevet _agent: %v\n", err)
+		return exitError
 	}
 	return code
 }

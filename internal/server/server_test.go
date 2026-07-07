@@ -1,4 +1,4 @@
-package server
+package server_test
 
 import (
 	"context"
@@ -8,63 +8,26 @@ import (
 	"testing"
 	"time"
 
-	"github.com/irodion/shevet/internal/client"
+	"github.com/irodion/shevet/internal/harness"
+	"github.com/irodion/shevet/internal/server"
 	"github.com/irodion/shevet/internal/testutil"
 )
+
+// The boot-and-connect choreography lives in harness.StartServer, shared
+// with the Level-1 harness — these tests double as client<->server
+// integration tests and keep exercising the dial path real Clients use.
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.DiscardHandler)
 }
 
-// startServer binds and serves a Server on socketPath. Listen is synchronous,
-// so the socket accepts connections as soon as this returns — no polling.
-// Cleanup stops the Server and asserts a clean shutdown.
-func startServer(t *testing.T, socketPath string) {
-	t.Helper()
-
-	srv := New(Options{SocketPath: socketPath}, discardLogger())
-	if err := srv.Listen(); err != nil {
-		t.Fatalf("Listen: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- srv.Serve(ctx) }()
-
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Errorf("Serve returned error on shutdown: %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Error("Serve did not return within 5s of cancellation")
-		}
-	})
-}
-
-// dial connects through the real Client package, so these tests double as
-// client<->server integration tests and keep exercising the dial path real
-// Clients use.
-func dial(t *testing.T, socketPath string) *client.Client {
-	t.Helper()
-	c, err := client.Dial(socketPath)
-	if err != nil {
-		t.Fatalf("client.Dial: %v", err)
-	}
-	t.Cleanup(func() { c.Close() })
-	return c
-}
-
 func TestServe_ServesEmptyHerd(t *testing.T) {
-	socketPath := testutil.SocketPath(t)
-	startServer(t, socketPath)
+	c := harness.StartServer(t, testutil.SocketPath(t))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	panes, err := dial(t, socketPath).ListPanes(ctx)
+	panes, err := c.ListPanes(ctx)
 	if err != nil {
 		t.Fatalf("ListPanes: %v", err)
 	}
@@ -76,7 +39,7 @@ func TestServe_ServesEmptyHerd(t *testing.T) {
 func TestServe_ShutsDownCleanlyAndRemovesSocket(t *testing.T) {
 	socketPath := testutil.SocketPath(t)
 
-	srv := New(Options{SocketPath: socketPath}, discardLogger())
+	srv := server.New(server.Options{SocketPath: socketPath}, discardLogger())
 	if err := srv.Listen(); err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -91,8 +54,8 @@ func TestServe_ShutsDownCleanlyAndRemovesSocket(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Serve returned %v after cancellation, want nil", err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Serve did not return within 5s of cancellation")
+	case <-time.After(testutil.WaitTimeout):
+		t.Fatal("Serve did not return after cancellation")
 	}
 
 	if _, err := os.Lstat(socketPath); !os.IsNotExist(err) {
@@ -102,9 +65,9 @@ func TestServe_ShutsDownCleanlyAndRemovesSocket(t *testing.T) {
 
 func TestListen_RefusesSecondServerOnSameSocket(t *testing.T) {
 	socketPath := testutil.SocketPath(t)
-	startServer(t, socketPath)
+	harness.StartServer(t, socketPath)
 
-	second := New(Options{SocketPath: socketPath}, discardLogger())
+	second := server.New(server.Options{SocketPath: socketPath}, discardLogger())
 	if err := second.Listen(); err == nil {
 		t.Fatal("second Listen on the same socket succeeded, want error")
 	}
@@ -126,11 +89,11 @@ func TestListen_ClearsStaleSocket(t *testing.T) {
 		t.Fatalf("stale socket file was not left behind: %v", err)
 	}
 
-	startServer(t, socketPath)
+	c := harness.StartServer(t, socketPath)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := dial(t, socketPath).ListPanes(ctx); err != nil {
+	if _, err := c.ListPanes(ctx); err != nil {
 		t.Fatalf("ListPanes after stale-socket recovery: %v", err)
 	}
 }
@@ -144,7 +107,7 @@ func TestListen_RefusesToReplaceNonSocketFile(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	srv := New(Options{SocketPath: socketPath}, discardLogger())
+	srv := server.New(server.Options{SocketPath: socketPath}, discardLogger())
 	if err := srv.Listen(); err == nil {
 		t.Fatal("Listen over a regular file succeeded, want error")
 	}
@@ -160,7 +123,7 @@ func TestListen_RefusesToReplaceNonSocketFile(t *testing.T) {
 
 func TestListen_RestrictsSocketPermissions(t *testing.T) {
 	socketPath := testutil.SocketPath(t)
-	startServer(t, socketPath)
+	harness.StartServer(t, socketPath)
 
 	info, err := os.Lstat(socketPath)
 	if err != nil {
@@ -172,14 +135,14 @@ func TestListen_RestrictsSocketPermissions(t *testing.T) {
 }
 
 func TestRun_RejectsEmptySocketPath(t *testing.T) {
-	srv := New(Options{}, discardLogger())
+	srv := server.New(server.Options{}, discardLogger())
 	if err := srv.Run(context.Background()); err == nil {
 		t.Fatal("Run with empty socket path succeeded, want error")
 	}
 }
 
 func TestServe_RequiresListen(t *testing.T) {
-	srv := New(Options{SocketPath: testutil.SocketPath(t)}, discardLogger())
+	srv := server.New(server.Options{SocketPath: testutil.SocketPath(t)}, discardLogger())
 	if err := srv.Serve(context.Background()); err == nil {
 		t.Fatal("Serve before Listen succeeded, want error")
 	}

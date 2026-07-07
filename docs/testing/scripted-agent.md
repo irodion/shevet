@@ -59,22 +59,28 @@ h := harness.Start(t)
 pane := h.StartAgent(t, "agent-a", script)
 
 h.Tmux.WaitForContent(t, pane, "Apply migration? [y/n]")
-h.Tmux.SendLine(t, pane, "y")           // the deterministic "advance"
+h.Tmux.SendLine(t, pane, "y")            // the deterministic "advance"
 h.Tmux.WaitForContent(t, pane, "migration applied")
-code := h.Tmux.WaitForExit(t, pane)      // remain-on-exit keeps the status
+code := h.WaitForAgentExit(t, pane)      // from the exit-marker line
 ```
 
 ## The harness around it
 
-`internal/harness` composes the three parties of every Level-1 scenario:
+Two packages, split so the tmux sandbox stays a leaf any layer can import
+(the control-mode slice's white-box Server tests included):
 
-- **`StartTmux(t)`** — a hermetic tmux server on a private socket
-  (`-f /dev/null`, `TMUX` scrubbed, `remain-on-exit` for exit-status
-  assertions). Teardown kills only the sandbox server; a developer's own
-  tmux is never touched. Skips when tmux is absent; CI installs it.
-- **`Start(t)`** — sandbox + in-process Shevet Server (synchronous `Listen`,
-  race-detector visible) + the real typed gRPC client from
-  `internal/client`. The process boundary itself is covered separately by
-  the `e2e` smoke tests.
-- **`StartAgent(t, name, script)`** — a scripted agent in a fresh window,
-  returning the pane id (`%N`) to target.
+- **`internal/tmuxtest`** — the hermetic sandbox: `Start(t)` boots a private
+  tmux server (private socket, `-f /dev/null`, `TMUX` scrubbed) with *stock
+  options* — the Server under test must see the same tmux semantics a
+  user's tmux has. Teardown kills only the sandbox; a developer's own tmux
+  is never touched. Skips when tmux is absent; CI installs it.
+- **`internal/harness`** — the Level-1 composition:
+  - `Start(t)`: sandbox + in-process Shevet Server (synchronous `Listen`,
+    race-detector visible) + the real typed gRPC client from
+    `internal/client`. The process boundary itself is covered separately by
+    the `e2e` smoke tests.
+  - `StartAgent(t, name, script)`: a scripted agent in a fresh window,
+    returning the pane id (`%N`). The window command prints an exit marker
+    and parks after the agent ends, so `WaitForAgentExit` reads the code
+    from pane content — portable across tmux versions whose
+    `pane_dead_status` behavior differs.
