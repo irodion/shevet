@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 )
@@ -42,8 +43,34 @@ func TestRun_HelpGoesToStdout(t *testing.T) {
 	if !strings.Contains(stdout, "serve") || !strings.Contains(stdout, "connect") {
 		t.Errorf("help does not list core commands:\n%s", stdout)
 	}
-	if strings.Contains(stdout, "_proxy") {
-		t.Errorf("help leaks the hidden _proxy command:\n%s", stdout)
+	if strings.Contains(stdout, "_proxy") || strings.Contains(stdout, "_agent") {
+		t.Errorf("help leaks a hidden command:\n%s", stdout)
+	}
+}
+
+func TestAgent_RequiresScript(t *testing.T) {
+	code, _, stderr := run(t, "_agent")
+	if code != exitUsage {
+		t.Errorf("exit code = %d, want %d", code, exitUsage)
+	}
+	if !strings.Contains(stderr, "--script is required") {
+		t.Errorf("stderr does not explain the missing flag:\n%s", stderr)
+	}
+}
+
+func TestAgent_RejectsMalformedScript(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/bad.script"
+	if err := os.WriteFile(path, []byte("frobnicate\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	code, _, stderr := run(t, "_agent", "--script", path)
+	if code != exitUsage {
+		t.Errorf("exit code = %d, want %d", code, exitUsage)
+	}
+	if !strings.Contains(stderr, "unknown op") {
+		t.Errorf("stderr does not name the parse error:\n%s", stderr)
 	}
 }
 

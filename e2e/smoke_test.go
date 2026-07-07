@@ -11,7 +11,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -23,33 +22,6 @@ import (
 
 	"github.com/irodion/shevet/internal/testutil"
 )
-
-const waitTimeout = 10 * time.Second
-
-// buildBinary compiles shevet once per test run into a shared temp dir.
-var buildBinary = sync.OnceValues(func() (string, error) {
-	dir, err := os.MkdirTemp("", "shevet-e2e-*")
-	if err != nil {
-		return "", err
-	}
-	bin := filepath.Join(dir, "shevet")
-
-	cmd := exec.Command("go", "build", "-o", bin, "github.com/irodion/shevet")
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("go build: %v\n%s", err, out)
-	}
-	return bin, nil
-})
-
-func binaryPath(t *testing.T) string {
-	t.Helper()
-	bin, err := buildBinary()
-	if err != nil {
-		t.Fatalf("build shevet binary: %v", err)
-	}
-	return bin
-}
 
 // startServe launches `shevet serve` and waits until its socket accepts
 // connections. It returns the running command; the caller owns shutdown.
@@ -68,27 +40,26 @@ func startServe(t *testing.T, bin, socket string) *exec.Cmd {
 		}
 	})
 
-	deadline := time.Now().Add(waitTimeout)
-	for time.Now().Before(deadline) {
-		if conn, err := net.Dial("unix", socket); err == nil {
-			conn.Close()
-			return cmd
+	testutil.Eventually(t, "serve socket "+socket+" to accept connections", func() (bool, string) {
+		conn, err := net.Dial("unix", socket)
+		if err != nil {
+			return false, err.Error()
 		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("serve socket %s never became dialable", socket)
-	return nil
+		conn.Close()
+		return true, ""
+	})
+	return cmd
 }
 
 func TestSmoke_ServeSIGTERMShutsDownCleanly(t *testing.T) {
-	bin := binaryPath(t)
+	bin := testutil.BuildBinary(t)
 	socket := testutil.SocketPath(t)
 	cmd := startServe(t, bin, socket)
 
 	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatalf("SIGTERM: %v", err)
 	}
-	if err := waitFor(cmd, waitTimeout); err != nil {
+	if err := waitFor(cmd, testutil.WaitTimeout); err != nil {
 		t.Fatalf("serve did not exit cleanly after SIGTERM: %v", err)
 	}
 	if _, err := os.Lstat(socket); !os.IsNotExist(err) {
@@ -100,7 +71,7 @@ func TestSmoke_ConnectRendersEmptyHerdAndQuits(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("PTY smoke test is unix-only")
 	}
-	bin := binaryPath(t)
+	bin := testutil.BuildBinary(t)
 	socket := testutil.SocketPath(t)
 	serve := startServe(t, bin, socket)
 
@@ -138,25 +109,22 @@ func TestSmoke_ConnectRendersEmptyHerdAndQuits(t *testing.T) {
 		return out.String()
 	}
 
-	deadline := time.Now().Add(waitTimeout)
-	for !strings.Contains(snapshot(), "0 Panes") {
-		if time.Now().After(deadline) {
-			t.Fatalf("dashboard never rendered \"0 Panes\"; output so far:\n%q", snapshot())
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	testutil.Eventually(t, `dashboard to render "0 Panes"`, func() (bool, string) {
+		s := snapshot()
+		return strings.Contains(s, "0 Panes"), fmt.Sprintf("%q", s)
+	})
 
 	if _, err := ptmx.WriteString("q"); err != nil {
 		t.Fatalf("send quit key: %v", err)
 	}
-	if err := waitFor(connect, waitTimeout); err != nil {
+	if err := waitFor(connect, testutil.WaitTimeout); err != nil {
 		t.Fatalf("connect did not exit cleanly after quit: %v", err)
 	}
 
 	if err := serve.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatalf("SIGTERM serve: %v", err)
 	}
-	if err := waitFor(serve, waitTimeout); err != nil {
+	if err := waitFor(serve, testutil.WaitTimeout); err != nil {
 		t.Fatalf("serve did not exit cleanly: %v", err)
 	}
 }
