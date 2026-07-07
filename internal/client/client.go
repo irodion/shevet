@@ -2,9 +2,10 @@
 // Server's unix socket and exposing typed calls to the rest of the Client
 // (TUI, CLI).
 //
-// In this slice the socket is dialed directly on the local machine; the SSH
-// tunnel slice routes the same dial through a remote Host without changing
-// this package's interface.
+// In this slice the socket is dialed directly on the local machine. The SSH
+// transport slice (issue #10) adds reaching the same socket on a remote
+// Host; transport selection belongs in this package — the CLI should keep
+// parsing targets, not dialing them.
 package client
 
 import (
@@ -15,6 +16,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/irodion/shevet/internal/herd"
+	"github.com/irodion/shevet/internal/wire"
 	shevetv1 "github.com/irodion/shevet/proto/shevet/v1"
 )
 
@@ -54,10 +56,7 @@ func (c *Client) ListPanes(ctx context.Context) ([]herd.Pane, error) {
 	}
 	panes := make([]herd.Pane, 0, len(resp.GetPanes()))
 	for _, p := range resp.GetPanes() {
-		panes = append(panes, herd.Pane{
-			ID:    p.GetId(),
-			Title: p.GetTitle(),
-		})
+		panes = append(panes, wire.PaneFromProto(p))
 	}
 	return panes, nil
 }

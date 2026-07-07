@@ -34,9 +34,6 @@ type Model struct {
 	panes  []herd.Pane
 	loaded bool
 	err    error
-
-	width  int
-	height int
 }
 
 // New returns a dashboard Model that will populate itself from lister.
@@ -59,21 +56,25 @@ type loadFailedMsg struct{ err error }
 
 // Init kicks off the initial Herd fetch.
 func (m Model) Init() tea.Cmd {
-	return m.fetchPanes
+	return fetchPanesCmd(m.lister)
 }
 
-func (m Model) fetchPanes() tea.Msg {
-	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
-	defer cancel()
+// fetchPanesCmd closes over only the lister, not the whole Model — commands
+// outlive the Model value that issued them, and should not carry it.
+func fetchPanesCmd(lister PaneLister) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
+		defer cancel()
 
-	panes, err := m.lister.ListPanes(ctx)
-	if err != nil {
-		return loadFailedMsg{err: err}
+		panes, err := lister.ListPanes(ctx)
+		if err != nil {
+			return loadFailedMsg{err: err}
+		}
+		return panesLoadedMsg(panes)
 	}
-	return panesLoadedMsg(panes)
 }
 
-// Update handles messages: quit keys, terminal resize, and fetch results.
+// Update handles messages: quit keys and fetch results.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
@@ -81,9 +82,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		}
-	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
 	case panesLoadedMsg:
 		m.panes = msg
 		m.loaded = true

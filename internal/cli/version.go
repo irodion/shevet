@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"runtime"
 
 	"github.com/irodion/shevet/internal/version"
 )
@@ -15,6 +16,6 @@ func runVersion(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 
-	fmt.Fprintf(stdout, "shevet %s (%s)\n", version.String(), version.GoVersion())
+	fmt.Fprintf(stdout, "shevet %s (%s)\n", version.String(), runtime.Version())
 	return exitOK
 }

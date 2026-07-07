@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+
+	"github.com/irodion/shevet/internal/testutil"
 )
 
 const waitTimeout = 10 * time.Second
@@ -47,17 +49,6 @@ func binaryPath(t *testing.T) string {
 		t.Fatalf("build shevet binary: %v", err)
 	}
 	return bin
-}
-
-// shortSocketPath returns a socket path under the platform length limit.
-func shortSocketPath(t *testing.T) string {
-	t.Helper()
-	dir, err := os.MkdirTemp("", "shevet-e2e-*")
-	if err != nil {
-		t.Fatalf("MkdirTemp: %v", err)
-	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
-	return filepath.Join(dir, "s.sock")
 }
 
 // startServe launches `shevet serve` and waits until its socket accepts
@@ -91,7 +82,7 @@ func startServe(t *testing.T, bin, socket string) *exec.Cmd {
 
 func TestSmoke_ServeSIGTERMShutsDownCleanly(t *testing.T) {
 	bin := binaryPath(t)
-	socket := shortSocketPath(t)
+	socket := testutil.SocketPath(t)
 	cmd := startServe(t, bin, socket)
 
 	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
@@ -110,7 +101,7 @@ func TestSmoke_ConnectRendersEmptyHerdAndQuits(t *testing.T) {
 		t.Skip("PTY smoke test is unix-only")
 	}
 	bin := binaryPath(t)
-	socket := shortSocketPath(t)
+	socket := testutil.SocketPath(t)
 	serve := startServe(t, bin, socket)
 
 	connect := exec.Command(bin, "connect", "--socket", socket)

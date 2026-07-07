@@ -1,6 +1,10 @@
-package herd
+package server
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/irodion/shevet/internal/herd"
+)
 
 func TestNewRegistry_IsEmpty(t *testing.T) {
 	r := NewRegistry()
@@ -11,7 +15,7 @@ func TestNewRegistry_IsEmpty(t *testing.T) {
 
 func TestListPanes_ReturnsACopy(t *testing.T) {
 	r := NewRegistry()
-	r.panes = []Pane{{ID: "%1", Title: "agent-a"}}
+	r.panes = []herd.Pane{{ID: "%1", Title: "agent-a"}}
 
 	snapshot := r.ListPanes()
 	snapshot[0].Title = "mutated"

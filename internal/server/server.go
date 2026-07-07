@@ -18,51 +18,56 @@ import (
 
 	"google.golang.org/grpc"
 
-	"github.com/irodion/shevet/internal/herd"
 	shevetv1 "github.com/irodion/shevet/proto/shevet/v1"
 )
-
-// DefaultSocketPath returns the conventional Server socket location,
-// ~/.shevet/shevet.sock (see ARCHITECTURE.md §2).
-func DefaultSocketPath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("resolve home directory: %w", err)
-	}
-	return filepath.Join(home, ".shevet", "shevet.sock"), nil
-}
 
 // Options configures a Server.
 type Options struct {
 	// SocketPath is the unix socket the gRPC server listens on.
-	// Required; see DefaultSocketPath for the conventional location.
+	// Required; see paths.DefaultSocket for the conventional location.
 	SocketPath string
 }
 
 // Server serves the shevet.v1 API for one Host.
-// Construct with New; run with Run.
+// Construct with New; then either Run, or Listen followed by Serve.
 type Server struct {
 	opts     Options
-	registry *herd.Registry
+	registry *Registry
 	log      *slog.Logger
+	lis      net.Listener
 }
 
 // New returns a Server ready to Run. log must not be nil.
 func New(opts Options, log *slog.Logger) *Server {
 	return &Server{
 		opts:     opts,
-		registry: herd.NewRegistry(),
+		registry: NewRegistry(),
 		log:      log,
 	}
 }
 
-// Run listens on the configured unix socket and serves gRPC until ctx is
-// canceled, then shuts down gracefully (in-flight RPCs complete). It returns
-// nil after a clean, ctx-initiated shutdown, and an error otherwise.
-func (s *Server) Run(ctx context.Context) error {
+// Listen binds the Server's unix socket without serving yet. It fails fast
+// on a bad path or a live Server on the same socket. Once it returns, the
+// socket accepts connections (they are queued until Serve runs) — callers
+// that need readiness, like tests, get it here instead of polling.
+func (s *Server) Listen() error {
+	if s.lis != nil {
+		return errors.New("server is already listening")
+	}
 	lis, err := listenUnix(s.opts.SocketPath)
 	if err != nil {
 		return err
+	}
+	s.lis = lis
+	return nil
+}
+
+// Serve serves gRPC on the socket bound by Listen until ctx is canceled,
+// then shuts down gracefully (in-flight RPCs complete). It returns nil after
+// a clean, ctx-initiated shutdown, and an error otherwise.
+func (s *Server) Serve(ctx context.Context) error {
+	if s.lis == nil {
+		return errors.New("Serve called before Listen")
 	}
 	// The listener removes the socket file on Close; this is a belt-and-
 	// braces cleanup for the paths where Close is not reached.
@@ -73,20 +78,26 @@ func (s *Server) Run(ctx context.Context) error {
 
 	s.log.Info("server listening", "socket", s.opts.SocketPath)
 
-	serveErr := make(chan error, 1)
-	go func() {
-		serveErr <- grpcServer.Serve(lis)
-	}()
-
-	select {
-	case <-ctx.Done():
+	unregister := context.AfterFunc(ctx, func() {
 		s.log.Info("shutting down", "reason", context.Cause(ctx))
 		grpcServer.GracefulStop()
-		<-serveErr // Serve returns once Stop completes; error is moot here.
-		return nil
-	case err := <-serveErr:
+	})
+	defer unregister()
+
+	// Serve returns nil when GracefulStop initiated the stop, and
+	// ErrServerStopped when ctx was canceled before serving began.
+	if err := grpcServer.Serve(s.lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 		return fmt.Errorf("grpc serve: %w", err)
 	}
+	return nil
+}
+
+// Run is Listen followed by Serve: the whole Server lifecycle in one call.
+func (s *Server) Run(ctx context.Context) error {
+	if err := s.Listen(); err != nil {
+		return err
+	}
+	return s.Serve(ctx)
 }
 
 // listenUnix prepares and listens on a unix socket path: it creates the

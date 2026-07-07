@@ -13,12 +13,15 @@ PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 build: ## Build the shevet binary for the current platform
 	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o bin/shevet .
 
-.PHONY: cross
-cross: ## Verify the binary builds for every supported platform
-	@for platform in $(PLATFORMS); do \
-		GOOS=$${platform%/*} GOARCH=$${platform#*/} $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o /dev/null . \
-			&& echo "ok  $$platform" || exit 1; \
-	done
+# One phony target per platform so `make -j cross` builds them concurrently.
+CROSS_TARGETS := $(addprefix cross-,$(subst /,-,$(PLATFORMS)))
+
+.PHONY: cross $(CROSS_TARGETS)
+cross: $(CROSS_TARGETS) ## Verify the binary builds for every supported platform (parallel with -j)
+
+$(CROSS_TARGETS): cross-%:
+	@GOOS=$(word 1,$(subst -, ,$*)) GOARCH=$(word 2,$(subst -, ,$*)) \
+		$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o /dev/null . && echo "ok  $(subst -,/,$*)"
 
 .PHONY: test
 test: ## Run all tests with the race detector
@@ -28,7 +31,7 @@ test: ## Run all tests with the race detector
 lint: ## gofmt, go vet, staticcheck (module packages only; docs/research has its own modules)
 	@fmt_out=$$(gofmt -l $$(git ls-files '*.go' ':!docs/')); if [ -n "$$fmt_out" ]; then echo "gofmt needed:"; echo "$$fmt_out"; exit 1; fi
 	go vet ./...
-	go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 ./...
+	go tool staticcheck ./...
 
 .PHONY: proto
 proto: ## Regenerate gRPC/protobuf code (requires protoc, protoc-gen-go, protoc-gen-go-grpc)

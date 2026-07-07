@@ -16,9 +16,8 @@ import (
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	code := cli.Run(ctx, os.Args[1:], os.Stdout, os.Stderr)
-	stop()
+	stop() // no defer: os.Exit does not run deferred calls
 	os.Exit(code)
 }

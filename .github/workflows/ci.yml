@@ -25,4 +25,4 @@ jobs:
         run: make test
 
       - name: Cross-compile all supported platforms
-        run: make cross
+        run: make -j4 cross

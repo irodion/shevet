@@ -97,11 +97,3 @@ func TestUpdate_QuitKeys(t *testing.T) {
 		}
 	}
 }
-
-func TestUpdate_TracksWindowSize(t *testing.T) {
-	updated, _ := New(fakeLister{}).Update(tea.WindowSizeMsg{Width: 80, Height: 24})
-	m := updated.(Model)
-	if m.width != 80 || m.height != 24 {
-		t.Errorf("window size = %dx%d, want 80x24", m.width, m.height)
-	}
-}
