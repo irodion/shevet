@@ -31,7 +31,10 @@ test: ## Run all tests with the race detector
 lint: ## gofmt, go vet, staticcheck (module packages only; docs/research has its own modules)
 	@fmt_out=$$(gofmt -l $$(git ls-files '*.go' ':!docs/')); if [ -n "$$fmt_out" ]; then echo "gofmt needed:"; echo "$$fmt_out"; exit 1; fi
 	go vet ./...
-	go tool staticcheck ./...
+	@pkgs="$$(go list ./...)"; \
+		if [ -z "$$pkgs" ]; then echo "staticcheck: no packages matched — refusing to pass vacuously" >&2; exit 1; fi; \
+		echo "go tool staticcheck [$$(echo "$$pkgs" | wc -l | tr -d ' ') packages]"; \
+		go tool staticcheck $$pkgs
 
 .PHONY: proto
 proto: ## Regenerate gRPC/protobuf code (requires protoc, protoc-gen-go, protoc-gen-go-grpc)

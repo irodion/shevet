@@ -135,6 +135,29 @@ func TestListen_ClearsStaleSocket(t *testing.T) {
 	}
 }
 
+func TestListen_RefusesToReplaceNonSocketFile(t *testing.T) {
+	socketPath := testutil.SocketPath(t)
+
+	// A user typo: --socket pointing at an existing regular file.
+	const content = "precious data"
+	if err := os.WriteFile(socketPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	srv := New(Options{SocketPath: socketPath}, discardLogger())
+	if err := srv.Listen(); err == nil {
+		t.Fatal("Listen over a regular file succeeded, want error")
+	}
+
+	got, err := os.ReadFile(socketPath)
+	if err != nil {
+		t.Fatalf("the file was removed: %v", err)
+	}
+	if string(got) != content {
+		t.Errorf("file content changed: got %q, want %q", got, content)
+	}
+}
+
 func TestListen_RestrictsSocketPermissions(t *testing.T) {
 	socketPath := testutil.SocketPath(t)
 	startServer(t, socketPath)

@@ -130,12 +130,17 @@ func listenUnix(path string) (net.Listener, error) {
 
 // clearStaleSocket removes a leftover socket file from an unclean shutdown.
 // If something is actually accepting connections on it, another Server is
-// alive and this one must not start.
+// alive and this one must not start. Anything that is not a unix socket is
+// left untouched: a mistyped --socket must never delete a user's file.
 func clearStaleSocket(path string) error {
-	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	} else if err != nil {
 		return fmt.Errorf("inspect existing socket %s: %w", path, err)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("%s already exists and is not a unix socket; refusing to replace it", path)
 	}
 
 	conn, err := net.Dial("unix", path)
