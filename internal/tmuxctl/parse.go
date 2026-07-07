@@ -30,12 +30,12 @@ type parser struct {
 // topologyNotifications are the notifications after which the pane set, a
 // pane's geometry, or a title may differ from the Server's registry.
 var topologyNotifications = map[string]bool{
-	"%window-add":            true,
-	"%window-close":          true,
-	"%unlinked-window-close": true,
-	"%window-renamed":        true,
-	"%layout-change":         true,
-	"%window-pane-changed":   true,
+	"%window-add":             true,
+	"%window-close":           true,
+	"%unlinked-window-close":  true,
+	"%window-renamed":         true,
+	"%layout-change":          true,
+	"%window-pane-changed":    true,
 	"%session-window-changed": true,
 }
 
