@@ -19,7 +19,8 @@ const subscriberBuffer = 64
 
 // renderUpdate is one message bound for a Pane's render streams. Fields are
 // orthogonal: a resize and damage may travel together (resize first on the
-// wire); exited is terminal.
+// wire). Pane exit is not an update — it is the subscriber's exited flag,
+// so a full queue can never drop it.
 type renderUpdate struct {
 	// resized, when non-nil, is the pane's new size. Receivers reset
 	// their grid to default cells.
@@ -30,16 +31,19 @@ type renderUpdate struct {
 	// cursor-only batches (len(damage) == 0).
 	damage []grid.CellPatch
 	cursor grid.Cursor
-
-	// exited reports the Pane left the Herd; the stream ends after it.
-	exited bool
 }
 
-// subscriber is one WatchPane stream's view of a pipeline. Updates arrives
+// subscriber is one WatchPane stream's view of a pipeline. Updates arrive
 // on ch, which the pipeline closes when the pane exits, the subscriber is
 // removed, or the Server shuts down.
 type subscriber struct {
 	ch chan renderUpdate
+
+	// exited is set before ch closes when the Pane left the Herd (rather
+	// than the Server shutting down); the channel close ordering makes it
+	// safe to read after ch is drained. It is a flag, not a queued update,
+	// so the protocol's terminal PaneExited survives any backlog.
+	exited bool
 
 	// lagged is pipeline-goroutine state: the subscriber's queue overflowed
 	// and it owes a full resync instead of increments.
@@ -124,6 +128,7 @@ func (p *pipeline) run(w, h int) {
 	// flush — and only while someone is watching: an unwatched pane costs
 	// no snapshots, no diffs, and no wakeups. Its accumulated state is
 	// folded in by the flush a subscriber attach performs.
+	dirty := false
 	timer := time.NewTimer(flushInterval)
 	timer.Stop()
 	armed := false
@@ -152,31 +157,47 @@ func (p *pipeline) run(w, h int) {
 	}
 
 	flush := func() {
-		term.Snapshot(scratch)
-		damage := grid.Diff(shadow, scratch)
-		cur := term.Cursor()
-		if len(damage) == 0 && cur == cursor {
-			return
+		var u renderUpdate
+		changed := false
+		if dirty {
+			dirty = false
+			term.Snapshot(scratch)
+			damage := grid.Diff(shadow, scratch)
+			cur := term.Cursor()
+			if len(damage) > 0 || cur != cursor {
+				shadow, scratch = scratch, shadow
+				cursor = cur
+				if damage == nil {
+					damage = []grid.CellPatch{} // cursor-only batch, still damage-shaped
+				}
+				u = renderUpdate{damage: damage, cursor: cursor}
+				changed = true
+			}
 		}
-		shadow, scratch = scratch, shadow
-		cursor = cur
 
-		if damage == nil {
-			damage = []grid.CellPatch{} // cursor-only batch, still damage-shaped
-		}
-		u := renderUpdate{damage: damage, cursor: cursor}
+		stillLagged := false
 		for sub := range subs {
-			if !sub.lagged {
-				deliver(sub, u)
+			if sub.lagged {
+				// Catch a lagged subscriber up with one full resync
+				// instead of a queue of increments.
+				select {
+				case sub.ch <- syncUpdate():
+					sub.lagged = false
+				default:
+					stillLagged = true
+				}
 				continue
 			}
-			// Catch a lagged subscriber up with one full resync instead
-			// of a queue of increments.
-			select {
-			case sub.ch <- syncUpdate():
-				sub.lagged = false
-			default:
+			if changed {
+				deliver(sub, u)
+				stillLagged = stillLagged || sub.lagged
 			}
+		}
+		// A lagged subscriber must not depend on the pane producing more
+		// output: keep the flush cadence alive until its resync lands,
+		// even on an otherwise idle pane.
+		if stillLagged {
+			arm()
 		}
 	}
 
@@ -193,6 +214,7 @@ func (p *pipeline) run(w, h int) {
 		switch op := op.(type) {
 		case opOutput:
 			term.Write(op.data) //nolint:errcheck // the emulator consumes everything
+			dirty = true
 			arm()
 
 		case opResize:
@@ -209,6 +231,7 @@ func (p *pipeline) run(w, h int) {
 			for sub := range subs {
 				deliver(sub, u)
 			}
+			dirty = true
 			arm()
 
 		case opSubscribe:
@@ -226,9 +249,9 @@ func (p *pipeline) run(w, h int) {
 
 		case opClose:
 			for sub := range subs {
-				if op.exited {
-					deliver(sub, renderUpdate{exited: true})
-				}
+				// The flag, set before the close, cannot be dropped the
+				// way a queued update to a full channel would be.
+				sub.exited = op.exited
 				close(sub.ch)
 			}
 			return

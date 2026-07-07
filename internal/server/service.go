@@ -44,19 +44,25 @@ func (s *herdService) WatchPane(req *shevetv1.WatchPaneRequest, stream shevetv1.
 		return status.Errorf(codes.NotFound, "no pane %q in the Herd", req.GetPaneId())
 	}
 
+	sub := pipe.subscribe()
+
 	// relay forwards one queued update, reporting whether the stream is
-	// over (channel closed, send failure, or the terminal exited update).
+	// over. A closed channel ends the stream — with the protocol's
+	// terminal PaneExited first when the Pane left the Herd (the exited
+	// flag is set before the close, so reading it after the drain is
+	// safe, and unlike a queued update it can never be dropped).
 	relay := func(u renderUpdate, ok bool) (stop bool, err error) {
 		if !ok {
-			return true, nil // pane closed or Server shutting down
+			if sub.exited {
+				return true, sendExited(stream)
+			}
+			return true, nil // Server shutting down
 		}
 		if err := sendUpdate(stream, u); err != nil {
 			return true, err
 		}
-		return u.exited, nil
+		return false, nil
 	}
-
-	sub := pipe.subscribe()
 	for {
 		select {
 		case u, ok := <-sub.ch:
@@ -90,7 +96,7 @@ func (s *herdService) WatchPane(req *shevetv1.WatchPaneRequest, stream shevetv1.
 }
 
 // sendUpdate translates one renderUpdate into its wire messages: a resize,
-// then damage, then exited — the order receivers rely on.
+// then damage — the order receivers rely on.
 func sendUpdate(stream shevetv1.HerdService_WatchPaneServer, u renderUpdate) error {
 	if u.resized != nil {
 		msg := &shevetv1.PaneUpdate{Update: &shevetv1.PaneUpdate_Resized{
@@ -108,11 +114,12 @@ func sendUpdate(stream shevetv1.HerdService_WatchPaneServer, u renderUpdate) err
 			return err
 		}
 	}
-	if u.exited {
-		msg := &shevetv1.PaneUpdate{Update: &shevetv1.PaneUpdate_Exited{Exited: &shevetv1.PaneExited{}}}
-		if err := stream.Send(msg); err != nil {
-			return err
-		}
-	}
 	return nil
+}
+
+// sendExited sends the stream's terminal PaneExited message.
+func sendExited(stream shevetv1.HerdService_WatchPaneServer) error {
+	return stream.Send(&shevetv1.PaneUpdate{
+		Update: &shevetv1.PaneUpdate_Exited{Exited: &shevetv1.PaneExited{}},
+	})
 }

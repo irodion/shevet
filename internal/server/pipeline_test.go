@@ -123,22 +123,40 @@ func TestPipeline_LaggedSubscriberGetsFullResync(t *testing.T) {
 	}
 }
 
+// TestPipeline_LaggedSubscriberResyncsOnIdlePane pins the recovery
+// guarantee: a subscriber that overflowed during a burst converges to the
+// pane's final state even when the pane never produces another byte — the
+// pipeline keeps retrying the resync at the flush cadence, not only on the
+// next write.
+func TestPipeline_LaggedSubscriberResyncsOnIdlePane(t *testing.T) {
+	t.Parallel()
+	p := startPipeline(t, 40, 8)
+	v := view(t, p.subscribe())
+
+	// Overflow the undrained queue, then go idle: no further writes.
+	final := ""
+	for i := 0; i < 2*subscriberBuffer; i++ {
+		final = fmt.Sprintf("count %04d", i)
+		p.output([]byte("\x1b[1;1H" + final))
+		time.Sleep(2 * flushInterval) // separate flushes, to overflow the queue
+	}
+
+	v.waitFor(func(g *grid.Grid) bool { return g.RowText(0) == final })
+}
+
 func TestPipeline_CloseExitedTellsSubscribers(t *testing.T) {
 	t.Parallel()
 	p := newPipeline(10, 2)
 	sub := p.subscribe()
-	<-sub.ch // initial sync
 
+	// Leave the queue undrained: the exited signal is a flag set before
+	// the channel close, so no backlog can drop it.
 	p.close(true)
 
-	var sawExited bool
-	for u := range sub.ch {
-		if u.exited {
-			sawExited = true
-		}
+	for range sub.ch {
 	}
-	if !sawExited {
-		t.Error("subscriber channel closed without an exited update")
+	if !sub.exited {
+		t.Error("subscriber channel closed without the exited flag")
 	}
 }
 
@@ -150,10 +168,10 @@ func TestPipeline_CloseShutdownJustClosesChannels(t *testing.T) {
 
 	p.close(false)
 
-	for u := range sub.ch {
-		if u.exited {
-			t.Error("shutdown close reported the pane as exited")
-		}
+	for range sub.ch {
+	}
+	if sub.exited {
+		t.Error("shutdown close reported the pane as exited")
 	}
 }
 
