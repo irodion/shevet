@@ -28,7 +28,9 @@ import (
 func startServe(t *testing.T, bin, socket string, extraArgs ...string) *exec.Cmd {
 	t.Helper()
 
-	cmd := exec.Command(bin, append([]string{"serve", "--socket", socket}, extraArgs...)...)
+	// t.Context is canceled before cleanups run: a process still alive at
+	// test end is killed even if an assertion bailed out early.
+	cmd := exec.CommandContext(t.Context(), bin, append([]string{"serve", "--socket", socket}, extraArgs...)...)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start serve: %v", err)
@@ -103,7 +105,7 @@ func TestSmoke_ConnectRendersEmptyHerdAndQuits(t *testing.T) {
 func startConnectPTY(t *testing.T, bin, socket string) (*exec.Cmd, *os.File, func() string) {
 	t.Helper()
 
-	connect := exec.Command(bin, "connect", "--socket", socket)
+	connect := exec.CommandContext(t.Context(), bin, "connect", "--socket", socket)
 	connect.Env = append(os.Environ(), "TERM=xterm-256color")
 
 	ptmx, err := pty.StartWithSize(connect, &pty.Winsize{Rows: 24, Cols: 80})

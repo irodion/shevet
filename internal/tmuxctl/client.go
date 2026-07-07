@@ -58,6 +58,19 @@ type Client struct {
 	pending   []chan reply // FIFO: tmux answers commands in send order
 	guardSeen bool         // the attach guard reply has been consumed
 	guardErr  string       // the guard's text when it was an %error: why the attach failed
+
+	// evQueue decouples event delivery from reply routing: the reader
+	// enqueues without ever blocking, a pump goroutine feeds Events().
+	// This is load-bearing, not a buffer tweak — a consumer is allowed to
+	// stop draining Events while it waits on Command (the watcher does
+	// exactly that during reconcile), and if the reader could block on a
+	// full events channel it would never reach the reply line that
+	// consumer is waiting for: a deadlock. The queue is unbounded; it only
+	// grows during those reply waits, which are single tmux round-trips.
+	evMu     sync.Mutex
+	evQueue  []Event
+	evEnded  bool          // reader finished; pump closes events once drained
+	evNotify chan struct{} // cap 1: kick the pump
 }
 
 // Attach starts a control-mode tmux client attached to the session and
@@ -98,14 +111,16 @@ func Attach(ctx context.Context, opts Options) (*Client, error) {
 	}
 
 	c := &Client{
-		cmd:    cmd,
-		stdin:  stdin,
-		stderr: stderr,
-		events: make(chan Event, 256),
-		done:   make(chan struct{}),
-		quit:   make(chan struct{}),
+		cmd:      cmd,
+		stdin:    stdin,
+		stderr:   stderr,
+		events:   make(chan Event),
+		done:     make(chan struct{}),
+		quit:     make(chan struct{}),
+		evNotify: make(chan struct{}, 1),
 	}
 	go c.readLoop(stdout)
+	go c.pumpEvents()
 
 	// Probe: any reply proves the attachment is live. A failed attach
 	// (no such session, no server) ends the stream instead, and Command
@@ -208,12 +223,7 @@ func (c *Client) readLoop(stdout io.Reader) {
 			ev = out
 		}
 		if ev != nil {
-			// A closed Client stops delivering instead of blocking on a
-			// consumer that has already gone away.
-			select {
-			case c.events <- ev:
-			case <-c.quit:
-			}
+			c.enqueueEvent(ev)
 		}
 	}
 
@@ -222,7 +232,59 @@ func (c *Client) readLoop(stdout io.Reader) {
 	// Order matters: err must be visible before done releases the waiters
 	// in Command and streamErr.
 	close(c.done)
-	close(c.events)
+	c.endEvents()
+}
+
+// enqueueEvent hands a notification to the pump; it never blocks (see the
+// evQueue field comment for why that is a hard requirement).
+func (c *Client) enqueueEvent(ev Event) {
+	c.evMu.Lock()
+	c.evQueue = append(c.evQueue, ev)
+	c.evMu.Unlock()
+	select {
+	case c.evNotify <- struct{}{}:
+	default:
+	}
+}
+
+// endEvents tells the pump the stream is over; it closes Events() once the
+// queue is drained.
+func (c *Client) endEvents() {
+	c.evMu.Lock()
+	c.evEnded = true
+	c.evMu.Unlock()
+	select {
+	case c.evNotify <- struct{}{}:
+	default:
+	}
+}
+
+// pumpEvents delivers queued notifications to the Events channel, in stream
+// order. A closed Client discards instead of delivering, so teardown never
+// depends on a consumer still draining.
+func (c *Client) pumpEvents() {
+	for {
+		c.evMu.Lock()
+		queue := c.evQueue
+		c.evQueue = nil
+		ended := c.evEnded
+		c.evMu.Unlock()
+
+		for _, ev := range queue {
+			select {
+			case c.events <- ev:
+			case <-c.quit:
+			}
+		}
+		if len(queue) > 0 {
+			continue // the queue may have refilled; re-check before sleeping
+		}
+		if ended {
+			close(c.events)
+			return
+		}
+		<-c.evNotify
+	}
 }
 
 // completeReply hands a finished reply to the oldest waiting command.

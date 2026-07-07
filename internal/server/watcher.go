@@ -303,8 +303,13 @@ func (w *watcher) seed(ctx context.Context, paneID string, wp *watchedPane) erro
 	return nil
 }
 
+// maxPaneDim bounds accepted pane dimensions: far beyond any real terminal,
+// tight enough that a garbled geometry cannot become a giant allocation.
+const maxPaneDim = 16384
+
 // parsePaneLine parses one reconcile line: id, width, height, title,
-// tab-separated (titles may contain anything but tabs).
+// tab-separated (titles may contain anything but tabs). Geometry is
+// validated here, at the boundary where tmux data enters the Server.
 func parsePaneLine(line string) (paneInfo, error) {
 	parts := strings.SplitN(line, "\t", 4)
 	if len(parts) != 4 {
@@ -314,6 +319,9 @@ func parsePaneLine(line string) (paneInfo, error) {
 	info.id = parts[0]
 	if _, err := fmt.Sscanf(parts[1]+" "+parts[2], "%d %d", &info.width, &info.height); err != nil {
 		return paneInfo{}, fmt.Errorf("malformed pane geometry in %q: %w", line, err)
+	}
+	if info.width <= 0 || info.height <= 0 || info.width > maxPaneDim || info.height > maxPaneDim {
+		return paneInfo{}, fmt.Errorf("implausible pane geometry %dx%d in %q", info.width, info.height, line)
 	}
 	info.title = parts[3]
 	return info, nil

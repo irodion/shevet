@@ -119,6 +119,47 @@ func TestCommand_ConcurrentCallersGetTheirOwnReplies(t *testing.T) {
 	}
 }
 
+// TestCommand_SucceedsWhileEventsUndrained pins the no-deadlock contract: a
+// consumer may stop draining Events while it waits on a Command (the
+// Server's watcher does, during every reconcile), so replies must get
+// through even when a pane floods thousands of output notifications that
+// nobody is consuming.
+func TestCommand_SucceedsWhileEventsUndrained(t *testing.T) {
+	t.Parallel()
+	tm := tmuxtest.Start(t)
+	c := attach(t, tm)
+
+	// Nobody drains c.Events(); the flood must pile up harmlessly. ~2MB
+	// of output arrives as hundreds of %output notifications.
+	pane := tm.NewWindow(t, "flood", "seq 1 300000; sleep 86400")
+	tm.WaitForContent(t, pane, "300000")
+
+	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitTimeout)
+	defer cancel()
+	for i := 0; i < 20; i++ {
+		if _, err := c.Command(ctx, "display-message", "-p", "ok"); err != nil {
+			t.Fatalf("Command %d while events undrained: %v", i, err)
+		}
+	}
+
+	// Keep the scenario honest: it must involve more queued events than any
+	// fixed channel buffer could hide (the deadlock this test pins was a
+	// reader blocked on a full 256-slot channel).
+	events := 0
+	deadline := time.After(testutil.WaitTimeout)
+	for events <= 256 {
+		select {
+		case _, ok := <-c.Events():
+			if !ok {
+				t.Fatalf("event stream ended after only %d events", events)
+			}
+			events++
+		case <-deadline:
+			t.Fatalf("only %d events arrived; the flood no longer exercises the queue", events)
+		}
+	}
+}
+
 // TestOutput_ByteFidelity is the decoder's ground truth: bytes catted into a
 // pane must come out of the event stream byte-identical — escapes, UTF-8,
 // control characters, backslashes and all. The corpus is written newline-only
