@@ -51,6 +51,10 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		// Hidden: the stdio<->socket pump used as the SSH tunnel fallback.
 		// Deliberately absent from rootUsage.
 		return runProxy(ctx, rest, stderr)
+	case "_agent":
+		// Hidden: the scripted-agent test fixture. Deliberately absent
+		// from rootUsage.
+		return runAgent(rest, stdout, stderr)
 	case "-h", "--help", "help":
 		fmt.Fprint(stdout, rootUsage)
 		return exitOK

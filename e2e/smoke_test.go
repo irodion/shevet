@@ -11,7 +11,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -25,31 +24,6 @@ import (
 )
 
 const waitTimeout = 10 * time.Second
-
-// buildBinary compiles shevet once per test run into a shared temp dir.
-var buildBinary = sync.OnceValues(func() (string, error) {
-	dir, err := os.MkdirTemp("", "shevet-e2e-*")
-	if err != nil {
-		return "", err
-	}
-	bin := filepath.Join(dir, "shevet")
-
-	cmd := exec.Command("go", "build", "-o", bin, "github.com/irodion/shevet")
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("go build: %v\n%s", err, out)
-	}
-	return bin, nil
-})
-
-func binaryPath(t *testing.T) string {
-	t.Helper()
-	bin, err := buildBinary()
-	if err != nil {
-		t.Fatalf("build shevet binary: %v", err)
-	}
-	return bin
-}
 
 // startServe launches `shevet serve` and waits until its socket accepts
 // connections. It returns the running command; the caller owns shutdown.
@@ -81,7 +55,7 @@ func startServe(t *testing.T, bin, socket string) *exec.Cmd {
 }
 
 func TestSmoke_ServeSIGTERMShutsDownCleanly(t *testing.T) {
-	bin := binaryPath(t)
+	bin := testutil.BuildBinary(t)
 	socket := testutil.SocketPath(t)
 	cmd := startServe(t, bin, socket)
 
@@ -100,7 +74,7 @@ func TestSmoke_ConnectRendersEmptyHerdAndQuits(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("PTY smoke test is unix-only")
 	}
-	bin := binaryPath(t)
+	bin := testutil.BuildBinary(t)
 	socket := testutil.SocketPath(t)
 	serve := startServe(t, bin, socket)
 
