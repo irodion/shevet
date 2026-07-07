@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/irodion/shevet/internal/grid"
 	"github.com/irodion/shevet/internal/herd"
 	"github.com/irodion/shevet/internal/wire"
 	shevetv1 "github.com/irodion/shevet/proto/shevet/v1"
@@ -59,6 +60,64 @@ func (c *Client) ListPanes(ctx context.Context) ([]herd.Pane, error) {
 		panes = append(panes, wire.PaneFromProto(p))
 	}
 	return panes, nil
+}
+
+// PaneUpdate is one event from a Pane's render stream. Exactly one of the
+// field groups is meaningful per update: a resize, a damage batch (cells
+// plus cursor — cells may be empty for cursor-only movement), or exited.
+type PaneUpdate struct {
+	// Resized, when non-nil, is the Pane's new {width, height}; the
+	// receiver's grid resets to default cells.
+	Resized *[2]int
+
+	// Damage, when non-nil, is a batch of cell patches; Cursor is the
+	// cursor state after applying it.
+	Damage []grid.CellPatch
+	Cursor grid.Cursor
+
+	// Exited reports the Pane left the Herd; the stream ends after it.
+	Exited bool
+}
+
+// PaneWatch is a live render stream for one Pane. Receive with Recv until
+// an error or an Exited update; cancel the WatchPane context to stop.
+type PaneWatch struct {
+	stream grpc.ServerStreamingClient[shevetv1.PaneUpdate]
+}
+
+// WatchPane subscribes to a Pane's render stream. The first updates always
+// establish full current state (resize, then damage covering every
+// non-default cell); afterwards damage carries only changed cells.
+func (c *Client) WatchPane(ctx context.Context, paneID string) (*PaneWatch, error) {
+	stream, err := c.herd.WatchPane(ctx, &shevetv1.WatchPaneRequest{PaneId: paneID})
+	if err != nil {
+		return nil, fmt.Errorf("watch pane %s: %w", paneID, err)
+	}
+	return &PaneWatch{stream: stream}, nil
+}
+
+// Recv returns the next update, blocking until one arrives. It returns
+// io.EOF when the Server ends the stream.
+func (w *PaneWatch) Recv() (PaneUpdate, error) {
+	msg, err := w.stream.Recv()
+	if err != nil {
+		return PaneUpdate{}, err //nolint:wrapcheck // io.EOF must reach callers unwrapped
+	}
+
+	switch u := msg.GetUpdate().(type) {
+	case *shevetv1.PaneUpdate_Resized:
+		return PaneUpdate{Resized: &[2]int{int(u.Resized.GetWidth()), int(u.Resized.GetHeight())}}, nil
+	case *shevetv1.PaneUpdate_Damage:
+		damage := make([]grid.CellPatch, 0, len(u.Damage.GetCells()))
+		for _, p := range u.Damage.GetCells() {
+			damage = append(damage, wire.PatchFromProto(p))
+		}
+		return PaneUpdate{Damage: damage, Cursor: wire.CursorFromProto(u.Damage.GetCursor())}, nil
+	case *shevetv1.PaneUpdate_Exited:
+		return PaneUpdate{Exited: true}, nil
+	default:
+		return PaneUpdate{}, fmt.Errorf("unknown pane update %T", u)
+	}
 }
 
 // Close releases the underlying connection.

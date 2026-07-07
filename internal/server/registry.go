@@ -7,9 +7,8 @@ import (
 )
 
 // Registry is the Server-side source of truth for which Panes exist in the
-// Herd. In this slice it is an empty, concurrency-safe shell; later slices
-// populate it from tmux control-mode events and add the Spawn/Adopt
-// lifecycle.
+// Herd. The tmux watcher replaces its contents with each reconcile
+// snapshot; later slices add the Spawn/Adopt lifecycle.
 //
 // The zero value is not usable; construct with NewRegistry. All methods are
 // safe for concurrent use.
@@ -32,4 +31,15 @@ func (r *Registry) ListPanes() []herd.Pane {
 	out := make([]herd.Pane, len(r.panes))
 	copy(out, r.panes)
 	return out
+}
+
+// Replace swaps the Herd for a new snapshot. The Registry keeps its own
+// copy; callers may reuse panes afterwards.
+func (r *Registry) Replace(panes []herd.Pane) {
+	next := make([]herd.Pane, len(panes))
+	copy(next, panes)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.panes = next
 }

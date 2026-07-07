@@ -31,6 +31,7 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	HerdService_ListPanes_FullMethodName = "/shevet.v1.HerdService/ListPanes"
+	HerdService_WatchPane_FullMethodName = "/shevet.v1.HerdService/WatchPane"
 )
 
 // HerdServiceClient is the client API for HerdService service.
@@ -42,6 +43,12 @@ const (
 type HerdServiceClient interface {
 	// ListPanes returns every Pane currently in the Herd.
 	ListPanes(ctx context.Context, in *ListPanesRequest, opts ...grpc.CallOption) (*ListPanesResponse, error)
+	// WatchPane is the Matrix Render stream for one Pane: cell damage,
+	// cursor movement, and resizes, until the Pane exits or the Client
+	// hangs up. The first updates always establish the full current state
+	// (a resize followed by damage covering every non-default cell); after
+	// that, damage carries only cells that changed — never full frames.
+	WatchPane(ctx context.Context, in *WatchPaneRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PaneUpdate], error)
 }
 
 type herdServiceClient struct {
@@ -62,6 +69,25 @@ func (c *herdServiceClient) ListPanes(ctx context.Context, in *ListPanesRequest,
 	return out, nil
 }
 
+func (c *herdServiceClient) WatchPane(ctx context.Context, in *WatchPaneRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PaneUpdate], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &HerdService_ServiceDesc.Streams[0], HerdService_WatchPane_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[WatchPaneRequest, PaneUpdate]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type HerdService_WatchPaneClient = grpc.ServerStreamingClient[PaneUpdate]
+
 // HerdServiceServer is the server API for HerdService service.
 // All implementations must embed UnimplementedHerdServiceServer
 // for forward compatibility.
@@ -71,6 +97,12 @@ func (c *herdServiceClient) ListPanes(ctx context.Context, in *ListPanesRequest,
 type HerdServiceServer interface {
 	// ListPanes returns every Pane currently in the Herd.
 	ListPanes(context.Context, *ListPanesRequest) (*ListPanesResponse, error)
+	// WatchPane is the Matrix Render stream for one Pane: cell damage,
+	// cursor movement, and resizes, until the Pane exits or the Client
+	// hangs up. The first updates always establish the full current state
+	// (a resize followed by damage covering every non-default cell); after
+	// that, damage carries only cells that changed — never full frames.
+	WatchPane(*WatchPaneRequest, grpc.ServerStreamingServer[PaneUpdate]) error
 	mustEmbedUnimplementedHerdServiceServer()
 }
 
@@ -83,6 +115,9 @@ type UnimplementedHerdServiceServer struct{}
 
 func (UnimplementedHerdServiceServer) ListPanes(context.Context, *ListPanesRequest) (*ListPanesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListPanes not implemented")
+}
+func (UnimplementedHerdServiceServer) WatchPane(*WatchPaneRequest, grpc.ServerStreamingServer[PaneUpdate]) error {
+	return status.Error(codes.Unimplemented, "method WatchPane not implemented")
 }
 func (UnimplementedHerdServiceServer) mustEmbedUnimplementedHerdServiceServer() {}
 func (UnimplementedHerdServiceServer) testEmbeddedByValue()                     {}
@@ -123,6 +158,17 @@ func _HerdService_ListPanes_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _HerdService_WatchPane_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(WatchPaneRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(HerdServiceServer).WatchPane(m, &grpc.GenericServerStream[WatchPaneRequest, PaneUpdate]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type HerdService_WatchPaneServer = grpc.ServerStreamingServer[PaneUpdate]
+
 // HerdService_ServiceDesc is the grpc.ServiceDesc for HerdService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -135,6 +181,12 @@ var HerdService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _HerdService_ListPanes_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "WatchPane",
+			Handler:       _HerdService_WatchPane_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "shevet/v1/shevet.proto",
 }

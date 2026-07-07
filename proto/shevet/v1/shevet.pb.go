@@ -169,6 +169,462 @@ func (x *Pane) GetTitle() string {
 	return ""
 }
 
+type WatchPaneRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// pane_id identifies the Pane to watch, as returned by ListPanes.
+	PaneId        string `protobuf:"bytes,1,opt,name=pane_id,json=paneId,proto3" json:"pane_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WatchPaneRequest) Reset() {
+	*x = WatchPaneRequest{}
+	mi := &file_shevet_v1_shevet_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WatchPaneRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WatchPaneRequest) ProtoMessage() {}
+
+func (x *WatchPaneRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_shevet_v1_shevet_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WatchPaneRequest.ProtoReflect.Descriptor instead.
+func (*WatchPaneRequest) Descriptor() ([]byte, []int) {
+	return file_shevet_v1_shevet_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *WatchPaneRequest) GetPaneId() string {
+	if x != nil {
+		return x.PaneId
+	}
+	return ""
+}
+
+// PaneUpdate is one event on a Pane's render stream.
+type PaneUpdate struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Update:
+	//
+	//	*PaneUpdate_Damage
+	//	*PaneUpdate_Resized
+	//	*PaneUpdate_Exited
+	Update        isPaneUpdate_Update `protobuf_oneof:"update"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PaneUpdate) Reset() {
+	*x = PaneUpdate{}
+	mi := &file_shevet_v1_shevet_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PaneUpdate) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PaneUpdate) ProtoMessage() {}
+
+func (x *PaneUpdate) ProtoReflect() protoreflect.Message {
+	mi := &file_shevet_v1_shevet_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PaneUpdate.ProtoReflect.Descriptor instead.
+func (*PaneUpdate) Descriptor() ([]byte, []int) {
+	return file_shevet_v1_shevet_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *PaneUpdate) GetUpdate() isPaneUpdate_Update {
+	if x != nil {
+		return x.Update
+	}
+	return nil
+}
+
+func (x *PaneUpdate) GetDamage() *CellDamage {
+	if x != nil {
+		if x, ok := x.Update.(*PaneUpdate_Damage); ok {
+			return x.Damage
+		}
+	}
+	return nil
+}
+
+func (x *PaneUpdate) GetResized() *PaneResized {
+	if x != nil {
+		if x, ok := x.Update.(*PaneUpdate_Resized); ok {
+			return x.Resized
+		}
+	}
+	return nil
+}
+
+func (x *PaneUpdate) GetExited() *PaneExited {
+	if x != nil {
+		if x, ok := x.Update.(*PaneUpdate_Exited); ok {
+			return x.Exited
+		}
+	}
+	return nil
+}
+
+type isPaneUpdate_Update interface {
+	isPaneUpdate_Update()
+}
+
+type PaneUpdate_Damage struct {
+	Damage *CellDamage `protobuf:"bytes,1,opt,name=damage,proto3,oneof"`
+}
+
+type PaneUpdate_Resized struct {
+	Resized *PaneResized `protobuf:"bytes,2,opt,name=resized,proto3,oneof"`
+}
+
+type PaneUpdate_Exited struct {
+	Exited *PaneExited `protobuf:"bytes,3,opt,name=exited,proto3,oneof"`
+}
+
+func (*PaneUpdate_Damage) isPaneUpdate_Update() {}
+
+func (*PaneUpdate_Resized) isPaneUpdate_Update() {}
+
+func (*PaneUpdate_Exited) isPaneUpdate_Update() {}
+
+// CellDamage is a coalesced batch of cell updates plus the cursor state at
+// flush time. Damage is idempotent: applying a batch twice yields the same
+// grid.
+type CellDamage struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Cells []*CellPatch           `protobuf:"bytes,1,rep,name=cells,proto3" json:"cells,omitempty"`
+	// cursor is the cursor state after this batch. Always present.
+	Cursor        *Cursor `protobuf:"bytes,2,opt,name=cursor,proto3" json:"cursor,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CellDamage) Reset() {
+	*x = CellDamage{}
+	mi := &file_shevet_v1_shevet_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CellDamage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CellDamage) ProtoMessage() {}
+
+func (x *CellDamage) ProtoReflect() protoreflect.Message {
+	mi := &file_shevet_v1_shevet_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CellDamage.ProtoReflect.Descriptor instead.
+func (*CellDamage) Descriptor() ([]byte, []int) {
+	return file_shevet_v1_shevet_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *CellDamage) GetCells() []*CellPatch {
+	if x != nil {
+		return x.Cells
+	}
+	return nil
+}
+
+func (x *CellDamage) GetCursor() *Cursor {
+	if x != nil {
+		return x.Cursor
+	}
+	return nil
+}
+
+// CellPatch sets one cell of the grid. Field semantics mirror the internal
+// grid vocabulary: an absent/empty content is a blank cell, and zero colors
+// mean the terminal default.
+type CellPatch struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	X     uint32                 `protobuf:"varint,1,opt,name=x,proto3" json:"x,omitempty"`
+	Y     uint32                 `protobuf:"varint,2,opt,name=y,proto3" json:"y,omitempty"`
+	// content is the cell's grapheme cluster; empty means blank.
+	Content string `protobuf:"bytes,3,opt,name=content,proto3" json:"content,omitempty"`
+	// width is the number of columns the grapheme spans (0 for blank and
+	// spacer cells, 2 for CJK/emoji).
+	Width uint32 `protobuf:"varint,4,opt,name=width,proto3" json:"width,omitempty"`
+	// fg and bg encode colors as 0 for the terminal default, otherwise
+	// (1<<24)|RGB.
+	Fg uint32 `protobuf:"varint,5,opt,name=fg,proto3" json:"fg,omitempty"`
+	Bg uint32 `protobuf:"varint,6,opt,name=bg,proto3" json:"bg,omitempty"`
+	// attrs is the text-attribute bitmask (bold, faint, italic, underline,
+	// blink, reverse, strikethrough — bits 0..6).
+	Attrs         uint32 `protobuf:"varint,7,opt,name=attrs,proto3" json:"attrs,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CellPatch) Reset() {
+	*x = CellPatch{}
+	mi := &file_shevet_v1_shevet_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CellPatch) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CellPatch) ProtoMessage() {}
+
+func (x *CellPatch) ProtoReflect() protoreflect.Message {
+	mi := &file_shevet_v1_shevet_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CellPatch.ProtoReflect.Descriptor instead.
+func (*CellPatch) Descriptor() ([]byte, []int) {
+	return file_shevet_v1_shevet_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *CellPatch) GetX() uint32 {
+	if x != nil {
+		return x.X
+	}
+	return 0
+}
+
+func (x *CellPatch) GetY() uint32 {
+	if x != nil {
+		return x.Y
+	}
+	return 0
+}
+
+func (x *CellPatch) GetContent() string {
+	if x != nil {
+		return x.Content
+	}
+	return ""
+}
+
+func (x *CellPatch) GetWidth() uint32 {
+	if x != nil {
+		return x.Width
+	}
+	return 0
+}
+
+func (x *CellPatch) GetFg() uint32 {
+	if x != nil {
+		return x.Fg
+	}
+	return 0
+}
+
+func (x *CellPatch) GetBg() uint32 {
+	if x != nil {
+		return x.Bg
+	}
+	return 0
+}
+
+func (x *CellPatch) GetAttrs() uint32 {
+	if x != nil {
+		return x.Attrs
+	}
+	return 0
+}
+
+type Cursor struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	X             uint32                 `protobuf:"varint,1,opt,name=x,proto3" json:"x,omitempty"`
+	Y             uint32                 `protobuf:"varint,2,opt,name=y,proto3" json:"y,omitempty"`
+	Hidden        bool                   `protobuf:"varint,3,opt,name=hidden,proto3" json:"hidden,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Cursor) Reset() {
+	*x = Cursor{}
+	mi := &file_shevet_v1_shevet_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Cursor) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Cursor) ProtoMessage() {}
+
+func (x *Cursor) ProtoReflect() protoreflect.Message {
+	mi := &file_shevet_v1_shevet_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Cursor.ProtoReflect.Descriptor instead.
+func (*Cursor) Descriptor() ([]byte, []int) {
+	return file_shevet_v1_shevet_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *Cursor) GetX() uint32 {
+	if x != nil {
+		return x.X
+	}
+	return 0
+}
+
+func (x *Cursor) GetY() uint32 {
+	if x != nil {
+		return x.Y
+	}
+	return 0
+}
+
+func (x *Cursor) GetHidden() bool {
+	if x != nil {
+		return x.Hidden
+	}
+	return false
+}
+
+// PaneResized reports the Pane's grid size. It is always the first update
+// on a WatchPane stream and recurs whenever tmux resizes the pane; the
+// Client's grid resets to default cells on every resize, followed by damage
+// re-establishing content.
+type PaneResized struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Width         uint32                 `protobuf:"varint,1,opt,name=width,proto3" json:"width,omitempty"`
+	Height        uint32                 `protobuf:"varint,2,opt,name=height,proto3" json:"height,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PaneResized) Reset() {
+	*x = PaneResized{}
+	mi := &file_shevet_v1_shevet_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PaneResized) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PaneResized) ProtoMessage() {}
+
+func (x *PaneResized) ProtoReflect() protoreflect.Message {
+	mi := &file_shevet_v1_shevet_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PaneResized.ProtoReflect.Descriptor instead.
+func (*PaneResized) Descriptor() ([]byte, []int) {
+	return file_shevet_v1_shevet_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *PaneResized) GetWidth() uint32 {
+	if x != nil {
+		return x.Width
+	}
+	return 0
+}
+
+func (x *PaneResized) GetHeight() uint32 {
+	if x != nil {
+		return x.Height
+	}
+	return 0
+}
+
+// PaneExited reports that the Pane left the Herd (its process ended or the
+// window closed). It is the stream's final update.
+type PaneExited struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PaneExited) Reset() {
+	*x = PaneExited{}
+	mi := &file_shevet_v1_shevet_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PaneExited) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PaneExited) ProtoMessage() {}
+
+func (x *PaneExited) ProtoReflect() protoreflect.Message {
+	mi := &file_shevet_v1_shevet_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PaneExited.ProtoReflect.Descriptor instead.
+func (*PaneExited) Descriptor() ([]byte, []int) {
+	return file_shevet_v1_shevet_proto_rawDescGZIP(), []int{9}
+}
+
 var File_shevet_v1_shevet_proto protoreflect.FileDescriptor
 
 const file_shevet_v1_shevet_proto_rawDesc = "" +
@@ -179,9 +635,39 @@ const file_shevet_v1_shevet_proto_rawDesc = "" +
 	"\x05panes\x18\x01 \x03(\v2\x0f.shevet.v1.PaneR\x05panes\",\n" +
 	"\x04Pane\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x14\n" +
-	"\x05title\x18\x02 \x01(\tR\x05title2U\n" +
+	"\x05title\x18\x02 \x01(\tR\x05title\"+\n" +
+	"\x10WatchPaneRequest\x12\x17\n" +
+	"\apane_id\x18\x01 \x01(\tR\x06paneId\"\xac\x01\n" +
+	"\n" +
+	"PaneUpdate\x12/\n" +
+	"\x06damage\x18\x01 \x01(\v2\x15.shevet.v1.CellDamageH\x00R\x06damage\x122\n" +
+	"\aresized\x18\x02 \x01(\v2\x16.shevet.v1.PaneResizedH\x00R\aresized\x12/\n" +
+	"\x06exited\x18\x03 \x01(\v2\x15.shevet.v1.PaneExitedH\x00R\x06exitedB\b\n" +
+	"\x06update\"c\n" +
+	"\n" +
+	"CellDamage\x12*\n" +
+	"\x05cells\x18\x01 \x03(\v2\x14.shevet.v1.CellPatchR\x05cells\x12)\n" +
+	"\x06cursor\x18\x02 \x01(\v2\x11.shevet.v1.CursorR\x06cursor\"\x8d\x01\n" +
+	"\tCellPatch\x12\f\n" +
+	"\x01x\x18\x01 \x01(\rR\x01x\x12\f\n" +
+	"\x01y\x18\x02 \x01(\rR\x01y\x12\x18\n" +
+	"\acontent\x18\x03 \x01(\tR\acontent\x12\x14\n" +
+	"\x05width\x18\x04 \x01(\rR\x05width\x12\x0e\n" +
+	"\x02fg\x18\x05 \x01(\rR\x02fg\x12\x0e\n" +
+	"\x02bg\x18\x06 \x01(\rR\x02bg\x12\x14\n" +
+	"\x05attrs\x18\a \x01(\rR\x05attrs\"<\n" +
+	"\x06Cursor\x12\f\n" +
+	"\x01x\x18\x01 \x01(\rR\x01x\x12\f\n" +
+	"\x01y\x18\x02 \x01(\rR\x01y\x12\x16\n" +
+	"\x06hidden\x18\x03 \x01(\bR\x06hidden\";\n" +
+	"\vPaneResized\x12\x14\n" +
+	"\x05width\x18\x01 \x01(\rR\x05width\x12\x16\n" +
+	"\x06height\x18\x02 \x01(\rR\x06height\"\f\n" +
+	"\n" +
+	"PaneExited2\x98\x01\n" +
 	"\vHerdService\x12F\n" +
-	"\tListPanes\x12\x1b.shevet.v1.ListPanesRequest\x1a\x1c.shevet.v1.ListPanesResponseB4Z2github.com/irodion/shevet/proto/shevet/v1;shevetv1b\x06proto3"
+	"\tListPanes\x12\x1b.shevet.v1.ListPanesRequest\x1a\x1c.shevet.v1.ListPanesResponse\x12A\n" +
+	"\tWatchPane\x12\x1b.shevet.v1.WatchPaneRequest\x1a\x15.shevet.v1.PaneUpdate0\x01B4Z2github.com/irodion/shevet/proto/shevet/v1;shevetv1b\x06proto3"
 
 var (
 	file_shevet_v1_shevet_proto_rawDescOnce sync.Once
@@ -195,21 +681,35 @@ func file_shevet_v1_shevet_proto_rawDescGZIP() []byte {
 	return file_shevet_v1_shevet_proto_rawDescData
 }
 
-var file_shevet_v1_shevet_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_shevet_v1_shevet_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
 var file_shevet_v1_shevet_proto_goTypes = []any{
 	(*ListPanesRequest)(nil),  // 0: shevet.v1.ListPanesRequest
 	(*ListPanesResponse)(nil), // 1: shevet.v1.ListPanesResponse
 	(*Pane)(nil),              // 2: shevet.v1.Pane
+	(*WatchPaneRequest)(nil),  // 3: shevet.v1.WatchPaneRequest
+	(*PaneUpdate)(nil),        // 4: shevet.v1.PaneUpdate
+	(*CellDamage)(nil),        // 5: shevet.v1.CellDamage
+	(*CellPatch)(nil),         // 6: shevet.v1.CellPatch
+	(*Cursor)(nil),            // 7: shevet.v1.Cursor
+	(*PaneResized)(nil),       // 8: shevet.v1.PaneResized
+	(*PaneExited)(nil),        // 9: shevet.v1.PaneExited
 }
 var file_shevet_v1_shevet_proto_depIdxs = []int32{
 	2, // 0: shevet.v1.ListPanesResponse.panes:type_name -> shevet.v1.Pane
-	0, // 1: shevet.v1.HerdService.ListPanes:input_type -> shevet.v1.ListPanesRequest
-	1, // 2: shevet.v1.HerdService.ListPanes:output_type -> shevet.v1.ListPanesResponse
-	2, // [2:3] is the sub-list for method output_type
-	1, // [1:2] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	5, // 1: shevet.v1.PaneUpdate.damage:type_name -> shevet.v1.CellDamage
+	8, // 2: shevet.v1.PaneUpdate.resized:type_name -> shevet.v1.PaneResized
+	9, // 3: shevet.v1.PaneUpdate.exited:type_name -> shevet.v1.PaneExited
+	6, // 4: shevet.v1.CellDamage.cells:type_name -> shevet.v1.CellPatch
+	7, // 5: shevet.v1.CellDamage.cursor:type_name -> shevet.v1.Cursor
+	0, // 6: shevet.v1.HerdService.ListPanes:input_type -> shevet.v1.ListPanesRequest
+	3, // 7: shevet.v1.HerdService.WatchPane:input_type -> shevet.v1.WatchPaneRequest
+	1, // 8: shevet.v1.HerdService.ListPanes:output_type -> shevet.v1.ListPanesResponse
+	4, // 9: shevet.v1.HerdService.WatchPane:output_type -> shevet.v1.PaneUpdate
+	8, // [8:10] is the sub-list for method output_type
+	6, // [6:8] is the sub-list for method input_type
+	6, // [6:6] is the sub-list for extension type_name
+	6, // [6:6] is the sub-list for extension extendee
+	0, // [0:6] is the sub-list for field type_name
 }
 
 func init() { file_shevet_v1_shevet_proto_init() }
@@ -217,13 +717,18 @@ func file_shevet_v1_shevet_proto_init() {
 	if File_shevet_v1_shevet_proto != nil {
 		return
 	}
+	file_shevet_v1_shevet_proto_msgTypes[4].OneofWrappers = []any{
+		(*PaneUpdate_Damage)(nil),
+		(*PaneUpdate_Resized)(nil),
+		(*PaneUpdate_Exited)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_shevet_v1_shevet_proto_rawDesc), len(file_shevet_v1_shevet_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   3,
+			NumMessages:   10,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
