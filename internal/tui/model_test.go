@@ -395,6 +395,36 @@ func TestFocus_UnavailableWhenInputStreamFails(t *testing.T) {
 	}
 }
 
+func TestFocus_RetriesAfterInputFailure(t *testing.T) {
+	conn := &fakeConn{
+		panes:    []herd.Pane{{ID: "%1"}},
+		stream:   &fakeStream{updates: []client.PaneUpdate{{Resized: &grid.Size{W: 10, H: 3}}}},
+		sink:     &fakeSink{},
+		inputErr: errors.New("input stream refused"),
+	}
+	m, cmd := loadedModel(t, conn)
+	m, cmd = pump(t, m, cmd) // watchStarted -> recv
+	m, _ = pump(t, m, cmd)   // resize update
+
+	// First attempt fails and drops back to read-only.
+	m, cmd = press(t, m, tea.KeyPressMsg{Code: 'i', Text: "i"})
+	next, _ := m.Update(cmd()) // inputFailedMsg
+	m = next.(Model)
+	if m.focused || m.inputErr == nil {
+		t.Fatalf("after failure want read-only with a recorded error, got focused=%v err=%v", m.focused, m.inputErr)
+	}
+
+	// The Server recovers; re-entering passthrough retries the stream and
+	// forwards again, rather than swallowing keys forever.
+	conn.inputErr = nil
+	m = enterFocus(t, m)
+	m, _ = press(t, m, tea.KeyPressMsg{Code: 'z', Text: "z"})
+	waitKeys(t, conn.sink, "z")
+	if m.inputErr != nil {
+		t.Errorf("inputErr not cleared on retry: %v", m.inputErr)
+	}
+}
+
 func TestFocus_IgnoredWithoutALivePane(t *testing.T) {
 	// Empty Herd: nothing to type into, so 'i' must not enter passthrough.
 	m, _ := loadedModel(t, &fakeConn{})

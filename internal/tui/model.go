@@ -272,7 +272,12 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.focused = true
-		if m.input == nil && m.inputErr == nil {
+		// Open the stream when there isn't a live one — including a retry
+		// after a prior failure. Entering passthrough must never leave input
+		// nil, or keystrokes (and the read-only quit keys) would be swallowed
+		// with no way back except the leader.
+		if m.input == nil {
+			m.inputErr = nil
 			m.input = make(chan []byte, forwardBuffer)
 			return m, forwardInputCmd(m.ctx, m.conn, m.watching.ID, m.input)
 		}
