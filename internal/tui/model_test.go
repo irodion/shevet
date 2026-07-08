@@ -169,6 +169,9 @@ func watchingModel(t *testing.T, updates []client.PaneUpdate) (Model, *fakeConn)
 	conn := &fakeConn{
 		panes:  []herd.Pane{{ID: "%1", Title: "agent-a"}, {ID: "%2", Title: "agent-b"}},
 		stream: &fakeStream{updates: updates},
+		// Pre-created so the pointer is stable while the forwarding Cmd's
+		// goroutine writes through it (the fakeSink's mutex guards the data).
+		sink: &fakeSink{},
 	}
 
 	m, cmd := loadedModel(t, conn) // fetch -> watchPaneCmd
@@ -254,8 +257,9 @@ func liveModel(t *testing.T) (Model, *fakeConn) {
 	return watchingModel(t, []client.PaneUpdate{{Resized: &grid.Size{W: 10, H: 3}}})
 }
 
-// enterFocus presses 'i' and drives the input-stream open to completion,
-// returning a model in passthrough with its forwarder ready.
+// enterFocus presses 'i' and runs the forwarding Cmd on its own goroutine, as
+// the Bubble Tea runtime would — leaving a model in passthrough whose
+// keystrokes drain to the fake sink.
 func enterFocus(t *testing.T, m Model) Model {
 	t.Helper()
 	next, cmd := m.Update(tea.KeyPressMsg{Code: 'i', Text: "i"})
@@ -263,14 +267,10 @@ func enterFocus(t *testing.T, m Model) Model {
 	if !m.focused {
 		t.Fatal("pressing 'i' on a live Pane did not enter passthrough")
 	}
-	if cmd == nil {
+	if cmd == nil || m.input == nil {
 		t.Fatal("entering passthrough did not open the input stream")
 	}
-	next, _ = m.Update(cmd()) // inputReadyMsg
-	m = next.(Model)
-	if m.fwd == nil {
-		t.Fatalf("passthrough forwarder not ready: %v", m.inputErr)
-	}
+	go cmd() // opens the stream and drains m.input
 	return m
 }
 
@@ -350,25 +350,22 @@ func TestFocus_LeaderReturnsToReadOnly(t *testing.T) {
 func TestFocus_QueuesKeystrokesUntilStreamOpens(t *testing.T) {
 	m, conn := liveModel(t)
 
-	// Enter passthrough but hold the stream open in-flight.
+	// Enter passthrough, but hold the forwarding Cmd (which opens the stream
+	// and drains) unstarted.
 	m, openCmd := press(t, m, tea.KeyPressMsg{Code: 'i', Text: "i"})
-	if openCmd == nil {
+	if openCmd == nil || m.input == nil {
 		t.Fatal("entering passthrough did not open the input stream")
 	}
 
-	// A keystroke typed before the stream is ready must be queued, not lost.
+	// A keystroke typed before the stream is ready must be buffered, not lost.
 	m, _ = press(t, m, tea.KeyPressMsg{Code: 'x', Text: "x"})
-	if len(m.pending) != 1 {
-		t.Fatalf("pending = %d keystrokes, want 1 buffered before the stream opened", len(m.pending))
+	if len(m.input) != 1 {
+		t.Fatalf("buffered %d keystrokes, want 1 held before the stream opened", len(m.input))
 	}
 
-	// Once the stream opens, the queue flushes in order.
-	next, _ := m.Update(openCmd()) // inputReadyMsg -> flush
-	m = next.(Model)
+	// Once the forwarder runs, it opens the stream and drains the buffer.
+	go openCmd()
 	waitKeys(t, conn.sink, "x")
-	if len(m.pending) != 0 {
-		t.Errorf("pending not cleared after flush: %d", len(m.pending))
-	}
 }
 
 func TestFocus_UnavailableWhenInputStreamFails(t *testing.T) {

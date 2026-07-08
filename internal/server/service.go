@@ -135,55 +135,50 @@ func (s *herdService) SendInput(stream shevetv1.HerdService_SendInputServer) err
 			// Server shutdown: end cleanly so GracefulStop proceeds. The
 			// Client observes the stream close and can redial.
 			return nil
-		case r, ok := <-events.ch:
-			if !ok {
-				return nil // receiver stopped; stream is over
-			}
+		case r := <-events.ch:
 			if errors.Is(r.err, io.EOF) {
 				return stream.SendAndClose(&summary) //nolint:wrapcheck // terminal send; gRPC status is the wire truth
 			}
 			if r.err != nil {
 				return r.err //nolint:wrapcheck // already a gRPC-transport error
 			}
-			n, err := s.injectEvent(stream.Context(), r.ev)
-			if err != nil {
+			if err := s.injectEvent(stream.Context(), r.ev, &summary); err != nil {
 				return err
-			}
-			if n >= 0 {
-				summary.Events++
-				summary.Bytes += uint64(n)
 			}
 		}
 	}
 }
 
-// injectEvent routes one input event to its Pane. It returns the number of
-// bytes injected, or -1 when the event was dropped because its Pane is not in
-// the Herd (a benign race, not an error). An injection failure against a live
-// Pane is returned as a gRPC error that ends the stream.
-func (s *herdService) injectEvent(ctx context.Context, ev *shevetv1.InputEvent) (int, error) {
+// injectEvent routes one input event to its Pane, tallying what it delivered
+// into summary. An event with no Pane in the Herd, or of a kind this Server
+// doesn't handle yet, is dropped and left uncounted — a benign race, not an
+// error. An injection failure against a live Pane is returned as a gRPC error
+// that ends the stream.
+func (s *herdService) injectEvent(ctx context.Context, ev *shevetv1.InputEvent, summary *shevetv1.SendInputSummary) error {
 	keys := ev.GetKeys()
 	if keys == nil {
-		// An event kind this Server doesn't handle yet (focus, resize,
-		// paste, mouse arrive in later slices). Ignore it forward-compatibly.
-		return -1, nil
+		// A future event kind (focus, resize, paste, mouse). Ignore it
+		// forward-compatibly.
+		return nil
 	}
 	paneID, data := keys.GetPaneId(), keys.GetData()
 
 	// The Pane must be in the Herd. Resolving it here also means input can
 	// never reach a tmux pane the Server isn't tracking.
 	if s.hub.get(paneID) == nil {
-		return -1, nil
+		return nil
 	}
 	if s.injector == nil {
 		// Unreachable in practice — a Pane in the hub implies a tmux
 		// attachment — but stated so the invariant is explicit, not assumed.
-		return 0, status.Error(codes.Unavailable, "server has no tmux attachment to inject input")
+		return status.Error(codes.Unavailable, "server has no tmux attachment to inject input")
 	}
 	if err := inject.Keys(ctx, s.injector, paneID, data); err != nil {
-		return 0, status.Errorf(codes.Unavailable, "inject into pane %s: %v", paneID, err)
+		return status.Errorf(codes.Unavailable, "inject into pane %s: %v", paneID, err)
 	}
-	return len(data), nil
+	summary.Events++
+	summary.Bytes += uint64(len(data))
+	return nil
 }
 
 // inputResult is one delivery from the Control Input stream.

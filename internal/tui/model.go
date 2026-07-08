@@ -80,14 +80,14 @@ type Model struct {
 
 	// Input state. The base view is read-only (like the dashboard); focused
 	// switches to passthrough, where keystrokes are encoded and forwarded to
-	// the Pane and only the leader (Ctrl-\) is reserved to return. The
-	// Control Input stream opens lazily when passthrough is first entered:
-	// fwd carries keystrokes to a serializing goroutine, pending holds those
-	// typed in the window before it opened, and inputErr records a stream
-	// that could not open or broke (passthrough is then unavailable).
+	// the Pane and only the leader (Ctrl-\) is reserved to return. Entering
+	// passthrough allocates input and hands it to a forwarding Cmd that opens
+	// the Control Input stream and drains the channel onto it in order;
+	// keystrokes typed before the stream opens wait in the buffer. inputErr
+	// records a stream that could not open or broke (passthrough is then
+	// unavailable).
 	focused  bool
-	fwd      *forwarder
-	pending  [][]byte
+	input    chan []byte
 	inputErr error
 }
 
@@ -114,10 +114,6 @@ type watchStartedMsg struct{ stream PaneStream }
 type paneUpdateMsg client.PaneUpdate
 
 type watchFailedMsg struct{ err error }
-
-// inputReadyMsg carries the opened Control Input stream's forwarder; keys
-// typed before it arrived are flushed on receipt.
-type inputReadyMsg struct{ fwd *forwarder }
 
 // inputFailedMsg reports that passthrough input is unavailable — the stream
 // could not open, or a forwarded keystroke failed. Rendering is unaffected.
@@ -167,69 +163,41 @@ func recvCmd(stream PaneStream) tea.Cmd {
 }
 
 // forwardBuffer is the depth of the keystroke queue between the UI goroutine
-// and the sender. It only fills if the socket stalls faster than a human
-// types — orders of magnitude more headroom than real typing needs.
+// and the forwarding Cmd. It only fills if the socket stalls faster than a
+// human types — orders of magnitude more headroom than real typing needs —
+// and it also holds keystrokes typed before the stream finishes opening.
 const forwardBuffer = 256
 
-// forwarder serializes keystroke delivery onto one goroutine, so bytes reach
-// the Pane in order and off the UI goroutine. Update hands it encoded bytes;
-// it calls SendKeys sequentially until the context ends or a send fails. A
-// gRPC client stream is not safe for concurrent use, which is exactly why a
-// single owning goroutine — not a Cmd per keystroke — does the sending.
-type forwarder struct {
-	ch   chan []byte
-	errs chan error
-}
-
-// startForwarder opens the sender goroutine over an input sink for one Pane.
-func startForwarder(ctx context.Context, sink InputSink, paneID string) *forwarder {
-	f := &forwarder{ch: make(chan []byte, forwardBuffer), errs: make(chan error, 1)}
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case data := <-f.ch:
-				if err := sink.SendKeys(paneID, data); err != nil {
-					f.errs <- err // cap 1, sent once, then the goroutine ends
-					return
-				}
-			}
-		}
-	}()
-	return f
-}
-
-// send hands one encoded keystroke to the forwarder, giving up only if the
-// program is shutting down (so a stalled socket cannot wedge the UI forever).
-func (f *forwarder) send(ctx context.Context, data []byte) {
-	select {
-	case f.ch <- data:
-	case <-ctx.Done():
-	}
-}
-
-// openInputCmd opens the Control Input stream and starts its forwarder.
-func openInputCmd(ctx context.Context, conn Conn, paneID string) tea.Cmd {
+// forwardInputCmd opens the Control Input stream and then drains keystrokes
+// from ch onto it, in order, on this one Cmd's goroutine — so a gRPC client
+// stream (not safe for concurrent use) has a single owner, and the UI
+// goroutine never blocks on the socket. It returns inputFailedMsg if the
+// stream cannot open or a send fails, and nothing when the program ends.
+func forwardInputCmd(ctx context.Context, conn Conn, paneID string, ch <-chan []byte) tea.Cmd {
 	return func() tea.Msg {
 		sink, err := conn.SendInput(ctx)
 		if err != nil {
 			return inputFailedMsg{err: err}
 		}
-		return inputReadyMsg{fwd: startForwarder(ctx, sink, paneID)}
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case data := <-ch:
+				if err := sink.SendKeys(paneID, data); err != nil {
+					return inputFailedMsg{err: err}
+				}
+			}
+		}
 	}
 }
 
-// waitInputErrCmd surfaces the first forwarder failure as an inputFailedMsg,
-// or nothing if the program ends first.
-func waitInputErrCmd(ctx context.Context, fwd *forwarder) tea.Cmd {
-	return func() tea.Msg {
-		select {
-		case err := <-fwd.errs:
-			return inputFailedMsg{err: err}
-		case <-ctx.Done():
-			return nil
-		}
+// sendKey hands one encoded keystroke to the forwarding Cmd, giving up only if
+// the program is shutting down (so a stalled socket cannot wedge the UI).
+func sendKey(ctx context.Context, ch chan<- []byte, data []byte) {
+	select {
+	case ch <- data:
+	case <-ctx.Done():
 	}
 }
 
@@ -271,22 +239,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case watchFailedMsg:
 		m.err = msg.err
 
-	case inputReadyMsg:
-		m.fwd = msg.fwd
-		// Flush keystrokes typed in the window before the stream opened.
-		for _, data := range m.pending {
-			m.fwd.send(m.ctx, data)
-		}
-		m.pending = nil
-		return m, waitInputErrCmd(m.ctx, m.fwd)
-
 	case inputFailedMsg:
 		// Passthrough is unavailable; drop back to read-only but keep
 		// rendering. The error is not fatal to the dashboard.
 		m.inputErr = msg.err
 		m.focused = false
-		m.fwd = nil
-		m.pending = nil
+		m.input = nil
 	}
 	return m, nil
 }
@@ -300,13 +258,8 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.focused = false
 			return m, nil
 		}
-		if data := encodeKey(msg); len(data) > 0 {
-			switch {
-			case m.fwd != nil:
-				m.fwd.send(m.ctx, data)
-			case m.inputErr == nil:
-				m.pending = append(m.pending, data) // stream still opening
-			}
+		if data := encodeKey(msg); len(data) > 0 && m.input != nil {
+			sendKey(m.ctx, m.input, data)
 		}
 		return m, nil
 	}
@@ -319,8 +272,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.focused = true
-		if m.fwd == nil && m.inputErr == nil {
-			return m, openInputCmd(m.ctx, m.conn, m.watching.ID)
+		if m.input == nil && m.inputErr == nil {
+			m.input = make(chan []byte, forwardBuffer)
+			return m, forwardInputCmd(m.ctx, m.conn, m.watching.ID, m.input)
 		}
 	}
 	return m, nil
