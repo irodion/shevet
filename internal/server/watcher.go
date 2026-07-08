@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/irodion/shevet/internal/herd"
+	"github.com/irodion/shevet/internal/inject"
 	"github.com/irodion/shevet/internal/tmuxctl"
 )
 
@@ -123,6 +124,12 @@ func attachWatcher(ctx context.Context, opts TmuxOptions, registry *Registry, hu
 	}
 	return w, nil
 }
+
+// commander exposes the control-mode client as the injection seam SendInput
+// uses. It is the same client the watcher runs reconcile and seed on;
+// tmuxctl.Client.Command is safe for concurrent use, so injecting alongside
+// the watcher's own commands is well-defined.
+func (w *watcher) commander() inject.Commander { return w.ctl }
 
 // teardown empties the Herd, closes every pipeline, and detaches from tmux.
 func (w *watcher) teardown() {

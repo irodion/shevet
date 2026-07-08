@@ -147,6 +147,60 @@ func (w *PaneWatch) Recv() (PaneUpdate, error) {
 	}
 }
 
+// InputStream is a live Control Input stream to a Server. Forward keystrokes
+// with SendKeys; end it with Close, which returns the Server's delivery
+// summary. The stream is long-lived: one open stream carries a focused
+// session's typing, so a keystroke costs a Send, not an RPC handshake.
+type InputStream struct {
+	stream grpc.ClientStreamingClient[shevetv1.InputEvent, shevetv1.SendInputSummary]
+}
+
+// InputSummary is the Server's tally of a closed Control Input stream: how
+// many events it accepted and how many bytes it injected. It is a diagnostic
+// acknowledgement, not a per-keystroke ack.
+type InputSummary struct {
+	Events uint64
+	Bytes  uint64
+}
+
+// SendInput opens a Control Input stream to the Server. Cancel ctx (or Close
+// the Client) to tear it down; the returned stream is not safe for concurrent
+// SendKeys.
+func (c *Client) SendInput(ctx context.Context) (*InputStream, error) {
+	stream, err := c.herd.SendInput(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("open input stream: %w", err)
+	}
+	return &InputStream{stream: stream}, nil
+}
+
+// SendKeys forwards raw input bytes for a Pane. The Server injects them
+// exactly — printable UTF-8 literally, control bytes by hex — so the Client
+// is responsible only for encoding keystrokes to terminal bytes, never for
+// how tmux delivers them. Empty data is a no-op.
+func (s *InputStream) SendKeys(paneID string, data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	err := s.stream.Send(&shevetv1.InputEvent{Event: &shevetv1.InputEvent_Keys{
+		Keys: &shevetv1.KeyBytes{PaneId: paneID, Data: data},
+	}})
+	if err != nil {
+		return fmt.Errorf("send keys to pane %s: %w", paneID, err)
+	}
+	return nil
+}
+
+// Close half-closes the stream and returns the Server's summary. After Close
+// the stream must not be used again.
+func (s *InputStream) Close() (InputSummary, error) {
+	sum, err := s.stream.CloseAndRecv()
+	if err != nil {
+		return InputSummary{}, fmt.Errorf("close input stream: %w", err)
+	}
+	return InputSummary{Events: sum.GetEvents(), Bytes: sum.GetBytes()}, nil
+}
+
 // Close releases the underlying connection.
 func (c *Client) Close() error {
 	return c.conn.Close()
