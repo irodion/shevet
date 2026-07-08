@@ -84,6 +84,27 @@ func TestPipeline_SubscriberGetsSyncThenIncrements(t *testing.T) {
 	}
 }
 
+// TestPipeline_FirstUpdateIsAlwaysTheResize pins the stream contract: a
+// subscriber's first message is the initial resize, even when the pane
+// accumulated unwatched output that the attach itself flushes.
+func TestPipeline_FirstUpdateIsAlwaysTheResize(t *testing.T) {
+	t.Parallel()
+	p := startPipeline(t, 20, 4)
+
+	// Dirty, unflushed state: with no subscribers the coalescer never ran.
+	p.output([]byte("dirty before anyone watches"))
+
+	sub := p.subscribe()
+	select {
+	case u := <-sub.ch:
+		if u.resized == nil {
+			t.Fatalf("first update = %+v, want the initial resize", u)
+		}
+	case <-time.After(testutil.WaitTimeout):
+		t.Fatal("no update arrived for a fresh subscriber")
+	}
+}
+
 func TestPipeline_BurstCoalescesIntoFewFlushes(t *testing.T) {
 	t.Parallel()
 	p := startPipeline(t, 60, 4)

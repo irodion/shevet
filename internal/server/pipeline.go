@@ -235,10 +235,13 @@ func (p *pipeline) run(w, h int) {
 			arm()
 
 		case opSubscribe:
-			subs[op.sub] = struct{}{}
-			// Fold any pending damage into the shadow first so the sync
-			// is current; the fresh queue always has room for it.
+			// Fold any pending damage into the shadow before adding the
+			// subscriber: its first message must be the sync's resize
+			// (the documented stream contract), never a stray damage
+			// batch from this flush. The fresh queue always has room for
+			// the sync.
 			flush()
+			subs[op.sub] = struct{}{}
 			op.sub.ch <- syncUpdate()
 
 		case opUnsubscribe:
