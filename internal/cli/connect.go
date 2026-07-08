@@ -35,6 +35,10 @@ func runConnect(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		return exitUsage
 	}
 
+	if path, nonBoot := executableOnNonBootVolume(); nonBoot {
+		fmt.Fprintf(stderr, "shevet connect: warning: %s (%s)\n", nonBootVolumeWarning, path)
+	}
+
 	c, err := client.Dial(*socket)
 	if err != nil {
 		fmt.Fprintf(stderr, "shevet connect: %v\n", err)

@@ -43,6 +43,10 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 
 	log := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: logLevel}))
 
+	if path, nonBoot := executableOnNonBootVolume(); nonBoot {
+		log.Warn(nonBootVolumeWarning, "path", path)
+	}
+
 	opts := server.Options{SocketPath: socketPath}
 	if *tmuxSession != "" {
 		opts.Tmux = &server.TmuxOptions{Socket: *tmuxSocket, Session: *tmuxSession}
