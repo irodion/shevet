@@ -128,6 +128,15 @@ func (s *herdService) SendInput(stream shevetv1.HerdService_SendInputServer) err
 	events := newInputReceiver(stream)
 	defer events.stop()
 
+	// Injection runs under a context that ends when the stream ends *or* the
+	// Server shuts down. stream.Context() alone isn't enough: GracefulStop
+	// waits on handlers without canceling their contexts, so a tmux command
+	// blocked inside inject.Keys would hold shutdown until the Client hangs
+	// up. Tying it to serveCtx lets shutdown cancel a wedged injection.
+	injectCtx, cancel := context.WithCancel(stream.Context())
+	defer cancel()
+	defer context.AfterFunc(s.serveCtx, cancel)()
+
 	var summary shevetv1.SendInputSummary
 	for {
 		select {
@@ -142,7 +151,7 @@ func (s *herdService) SendInput(stream shevetv1.HerdService_SendInputServer) err
 			if r.err != nil {
 				return r.err //nolint:wrapcheck // already a gRPC-transport error
 			}
-			if err := s.injectEvent(stream.Context(), r.ev, &summary); err != nil {
+			if err := s.injectEvent(injectCtx, r.ev, &summary); err != nil {
 				return err
 			}
 		}

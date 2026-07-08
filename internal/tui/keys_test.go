@@ -47,8 +47,10 @@ func TestEncodeKey(t *testing.T) {
 		{"left", tea.KeyPressMsg{Code: tea.KeyLeft}, "\x1b[D"},
 		{"home", tea.KeyPressMsg{Code: tea.KeyHome}, "\x1b[H"},
 		{"end", tea.KeyPressMsg{Code: tea.KeyEnd}, "\x1b[F"},
+		{"insert", tea.KeyPressMsg{Code: tea.KeyInsert}, "\x1b[2~"},
 		{"delete", tea.KeyPressMsg{Code: tea.KeyDelete}, "\x1b[3~"},
 		{"page up", tea.KeyPressMsg{Code: tea.KeyPgUp}, "\x1b[5~"},
+		{"page down", tea.KeyPressMsg{Code: tea.KeyPgDown}, "\x1b[6~"},
 
 		// Alt/Meta prefixes the base encoding with ESC.
 		{"alt-a", tea.KeyPressMsg{Code: 'a', Text: "a", Mod: tea.ModAlt}, "\x1ba"},

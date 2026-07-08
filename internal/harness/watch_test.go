@@ -28,9 +28,13 @@ type paneView struct {
 }
 
 // watchPane opens the render stream for a pane, bounded by the test's
-// standard wait timeout.
+// standard wait timeout. It first waits for the pane to enter the Herd, so a
+// watch issued right after StartAgent/NewWindow doesn't race the Server's
+// reconcile and get NotFound.
 func watchPane(t *testing.T, c *client.Client, paneID string) *paneView {
 	t.Helper()
+	waitForPaneInHerd(t, c, paneID)
+
 	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitTimeout)
 	t.Cleanup(cancel)
 
