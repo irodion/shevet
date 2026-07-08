@@ -2,15 +2,16 @@
 // Server's unix socket and exposing typed calls to the rest of the Client
 // (TUI, CLI).
 //
-// In this slice the socket is dialed directly on the local machine. The SSH
-// transport slice (issue #10) adds reaching the same socket on a remote
-// Host; transport selection belongs in this package — the CLI should keep
-// parsing targets, not dialing them.
+// Dial reaches a Server socket on the local machine; DialSSH reaches the same
+// socket on a remote Host over SSH (see ssh.go and internal/sshx). Transport
+// selection lives here — the CLI parses targets, this package dials them.
 package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -21,10 +22,15 @@ import (
 	shevetv1 "github.com/irodion/shevet/proto/shevet/v1"
 )
 
-// Client is a connection to one Server. Construct with Dial; always Close.
+// Client is a connection to one Server. Construct with Dial (local socket) or
+// DialSSH (remote Host over SSH); always Close.
 type Client struct {
 	conn *grpc.ClientConn
 	herd shevetv1.HerdServiceClient
+
+	// transport is the SSH connection underlying a DialSSH client, closed
+	// after the gRPC connection. Nil for a local Dial.
+	transport io.Closer
 }
 
 // Dial connects to the Server listening on the given unix socket path.
@@ -201,7 +207,12 @@ func (s *InputStream) Close() (InputSummary, error) {
 	return InputSummary{Events: sum.GetEvents(), Bytes: sum.GetBytes()}, nil
 }
 
-// Close releases the underlying connection.
+// Close releases the gRPC connection and, for an SSH client, the underlying
+// SSH connection beneath it.
 func (c *Client) Close() error {
-	return c.conn.Close()
+	err := c.conn.Close()
+	if c.transport != nil {
+		err = errors.Join(err, c.transport.Close())
+	}
+	return err //nolint:wrapcheck // aggregate teardown error, already contextual
 }
