@@ -125,12 +125,26 @@ func TestParse_RejectsMalformedScripts(t *testing.T) {
 		{"await-line with argument", "await-line now"},
 		{"sleep without duration", "sleep soon"},
 		{"exit without code", "exit loudly"},
+		{"read-raw without path", "read-raw 12"},
+		{"read-raw non-numeric count", "read-raw lots /tmp/x"},
+		{"read-raw negative count", "read-raw -1 /tmp/x"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := Parse(strings.NewReader(tc.script)); err == nil {
 				t.Errorf("Parse(%q) succeeded, want error", tc.script)
 			}
 		})
+	}
+}
+
+func TestParse_ReadRaw(t *testing.T) {
+	s := parse(t, "read-raw 42 /run/shevet/corpus.bin")
+	if len(s.steps) != 1 {
+		t.Fatalf("parsed %d steps, want 1", len(s.steps))
+	}
+	st := s.steps[0]
+	if st.op != opReadRaw || st.count != 42 || st.path != "/run/shevet/corpus.bin" {
+		t.Errorf("step = %+v, want read-raw count=42 path=/run/shevet/corpus.bin", st)
 	}
 }
 

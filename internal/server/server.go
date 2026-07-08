@@ -18,6 +18,7 @@ import (
 
 	"google.golang.org/grpc"
 
+	"github.com/irodion/shevet/internal/inject"
 	shevetv1 "github.com/irodion/shevet/proto/shevet/v1"
 )
 
@@ -80,6 +81,10 @@ func (s *Server) Serve(ctx context.Context) error {
 	// braces cleanup for the paths where Close is not reached.
 	defer os.Remove(s.opts.SocketPath) //nolint:errcheck // best-effort cleanup
 
+	// injector is the tmux command seam SendInput drives; it stays nil for a
+	// Server with no tmux attachment (an empty Herd has no Panes to type into).
+	var injector inject.Commander
+
 	// The watcher's lifetime nests inside Serve: canceled with ctx, and
 	// its pipelines are closed before Serve returns (watcher.run's defer),
 	// which in turn releases any WatchPane handlers GracefulStop waits on.
@@ -90,6 +95,7 @@ func (s *Server) Serve(ctx context.Context) error {
 			stopWatcher()
 			return fmt.Errorf("attach to tmux: %w", err)
 		}
+		injector = w.commander()
 		watcherDone := make(chan struct{})
 		go func() {
 			defer close(watcherDone)
@@ -109,7 +115,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 
 	grpcServer := grpc.NewServer()
-	shevetv1.RegisterHerdServiceServer(grpcServer, newHerdService(s.registry, s.hub))
+	shevetv1.RegisterHerdServiceServer(grpcServer, newHerdService(ctx, s.registry, s.hub, injector))
 
 	s.log.Info("server listening", "socket", s.opts.SocketPath)
 

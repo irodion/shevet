@@ -35,10 +35,17 @@ type PaneStream interface {
 type Conn interface {
 	ListPanes(ctx context.Context) ([]herd.Pane, error)
 	WatchPane(ctx context.Context, paneID string) (PaneStream, error)
+	SendInput(ctx context.Context) (InputSink, error)
 }
 
-// clientConn adapts *client.Client to Conn (its WatchPane returns the
-// concrete stream type).
+// InputSink is the Control Input stream as the dashboard drives it: forward
+// encoded keystrokes with SendKeys. *client.InputStream implements it.
+type InputSink interface {
+	SendKeys(paneID string, data []byte) error
+}
+
+// clientConn adapts *client.Client to Conn (its stream methods return the
+// concrete stream types).
 type clientConn struct{ c *client.Client }
 
 func (cc clientConn) ListPanes(ctx context.Context) ([]herd.Pane, error) {
@@ -47,6 +54,10 @@ func (cc clientConn) ListPanes(ctx context.Context) ([]herd.Pane, error) {
 
 func (cc clientConn) WatchPane(ctx context.Context, paneID string) (PaneStream, error) {
 	return cc.c.WatchPane(ctx, paneID) //nolint:wrapcheck // pure adapter
+}
+
+func (cc clientConn) SendInput(ctx context.Context) (InputSink, error) {
+	return cc.c.SendInput(ctx) //nolint:wrapcheck // pure adapter
 }
 
 // Model is the dashboard's Bubble Tea model. Construct with New.
@@ -66,6 +77,18 @@ type Model struct {
 	watching *herd.Pane
 	stream   PaneStream
 	view     *client.PaneView
+
+	// Input state. The base view is read-only (like the dashboard); focused
+	// switches to passthrough, where keystrokes are encoded and forwarded to
+	// the Pane and only the leader (Ctrl-\) is reserved to return. The
+	// Control Input stream opens lazily when passthrough is first entered:
+	// fwd carries keystrokes to a serializing goroutine, pending holds those
+	// typed in the window before it opened, and inputErr records a stream
+	// that could not open or broke (passthrough is then unavailable).
+	focused  bool
+	fwd      *forwarder
+	pending  [][]byte
+	inputErr error
 }
 
 // New returns a dashboard Model that will populate itself from conn.
@@ -91,6 +114,14 @@ type watchStartedMsg struct{ stream PaneStream }
 type paneUpdateMsg client.PaneUpdate
 
 type watchFailedMsg struct{ err error }
+
+// inputReadyMsg carries the opened Control Input stream's forwarder; keys
+// typed before it arrived are flushed on receipt.
+type inputReadyMsg struct{ fwd *forwarder }
+
+// inputFailedMsg reports that passthrough input is unavailable — the stream
+// could not open, or a forwarded keystroke failed. Rendering is unaffected.
+type inputFailedMsg struct{ err error }
 
 // Init kicks off the initial Herd fetch.
 func (m Model) Init() tea.Cmd {
@@ -135,14 +166,79 @@ func recvCmd(stream PaneStream) tea.Cmd {
 	}
 }
 
-// Update handles messages: quit keys, fetch results, and the render stream.
+// forwardBuffer is the depth of the keystroke queue between the UI goroutine
+// and the sender. It only fills if the socket stalls faster than a human
+// types — orders of magnitude more headroom than real typing needs.
+const forwardBuffer = 256
+
+// forwarder serializes keystroke delivery onto one goroutine, so bytes reach
+// the Pane in order and off the UI goroutine. Update hands it encoded bytes;
+// it calls SendKeys sequentially until the context ends or a send fails. A
+// gRPC client stream is not safe for concurrent use, which is exactly why a
+// single owning goroutine — not a Cmd per keystroke — does the sending.
+type forwarder struct {
+	ch   chan []byte
+	errs chan error
+}
+
+// startForwarder opens the sender goroutine over an input sink for one Pane.
+func startForwarder(ctx context.Context, sink InputSink, paneID string) *forwarder {
+	f := &forwarder{ch: make(chan []byte, forwardBuffer), errs: make(chan error, 1)}
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case data := <-f.ch:
+				if err := sink.SendKeys(paneID, data); err != nil {
+					f.errs <- err // cap 1, sent once, then the goroutine ends
+					return
+				}
+			}
+		}
+	}()
+	return f
+}
+
+// send hands one encoded keystroke to the forwarder, giving up only if the
+// program is shutting down (so a stalled socket cannot wedge the UI forever).
+func (f *forwarder) send(ctx context.Context, data []byte) {
+	select {
+	case f.ch <- data:
+	case <-ctx.Done():
+	}
+}
+
+// openInputCmd opens the Control Input stream and starts its forwarder.
+func openInputCmd(ctx context.Context, conn Conn, paneID string) tea.Cmd {
+	return func() tea.Msg {
+		sink, err := conn.SendInput(ctx)
+		if err != nil {
+			return inputFailedMsg{err: err}
+		}
+		return inputReadyMsg{fwd: startForwarder(ctx, sink, paneID)}
+	}
+}
+
+// waitInputErrCmd surfaces the first forwarder failure as an inputFailedMsg,
+// or nothing if the program ends first.
+func waitInputErrCmd(ctx context.Context, fwd *forwarder) tea.Cmd {
+	return func() tea.Msg {
+		select {
+		case err := <-fwd.errs:
+			return inputFailedMsg{err: err}
+		case <-ctx.Done():
+			return nil
+		}
+	}
+}
+
+// Update handles messages: keys, fetch results, the render stream, and the
+// input stream's lifecycle.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
-		switch msg.String() {
-		case "q", "ctrl+c":
-			return m, tea.Quit
-		}
+		return m.handleKey(msg)
 
 	case panesLoadedMsg:
 		m.panes = msg
@@ -174,8 +270,72 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case watchFailedMsg:
 		m.err = msg.err
+
+	case inputReadyMsg:
+		m.fwd = msg.fwd
+		// Flush keystrokes typed in the window before the stream opened.
+		for _, data := range m.pending {
+			m.fwd.send(m.ctx, data)
+		}
+		m.pending = nil
+		return m, waitInputErrCmd(m.ctx, m.fwd)
+
+	case inputFailedMsg:
+		// Passthrough is unavailable; drop back to read-only but keep
+		// rendering. The error is not fatal to the dashboard.
+		m.inputErr = msg.err
+		m.focused = false
+		m.fwd = nil
+		m.pending = nil
 	}
 	return m, nil
+}
+
+// handleKey routes a key press by mode. In read-only the dashboard owns the
+// keys (quit, and entering passthrough); in passthrough every key is encoded
+// and forwarded to the Pane except the reserved leader, which returns.
+func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if m.focused {
+		if isLeader(msg) {
+			m.focused = false
+			return m, nil
+		}
+		if data := encodeKey(msg); len(data) > 0 {
+			switch {
+			case m.fwd != nil:
+				m.fwd.send(m.ctx, data)
+			case m.inputErr == nil:
+				m.pending = append(m.pending, data) // stream still opening
+			}
+		}
+		return m, nil
+	}
+
+	switch msg.String() {
+	case "q", "ctrl+c":
+		return m, tea.Quit
+	case "i", "enter":
+		if !m.canFocus() {
+			return m, nil
+		}
+		m.focused = true
+		if m.fwd == nil && m.inputErr == nil {
+			return m, openInputCmd(m.ctx, m.conn, m.watching.ID)
+		}
+	}
+	return m, nil
+}
+
+// canFocus reports whether a live Pane is on screen to type into.
+func (m Model) canFocus() bool {
+	return m.watching != nil && m.view != nil && !m.view.Exited && sized(m.view.Grid)
+}
+
+// isLeader reports whether msg is the reserved passthrough leader (Ctrl-\),
+// the one chord that returns from passthrough instead of reaching the Pane.
+func isLeader(msg tea.KeyPressMsg) bool {
+	k := tea.Key(msg)
+	return k.Mod&tea.ModCtrl != 0 && k.Code == '\\'
 }
 
 // Styles are package-level for now; a theme arrives with the grid widget.

@@ -29,8 +29,32 @@ loudly instead of desynchronizing a test.
 | `print <text>` | text to end of line | write text + newline to stdout |
 | `prompt <text>` | text to end of line | write text *without* newline (renders as a waiting prompt) |
 | `await-line` | none | block until a line arrives on stdin |
+| `read-raw <count> <path>` | byte count, then a file path | capture exactly `count` bytes of input **verbatim** and write them to `path` |
 | `sleep <duration>` | Go duration (`200ms`, `3s`) | wall-clock delay (discouraged; see above) |
 | `exit <code>` | integer | terminate with the exit code (0–255) |
+
+### `read-raw`: byte-exact input capture
+
+`read-raw` is the input-side counterpart to `await-line`. Where `await-line`
+reads a cooked line and discards it, `read-raw` puts the pane's pty into **raw
+mode** (no line discipline: control bytes, CR/LF, and NUL arrive as data, not
+as signals or translations) and captures exactly `count` bytes to a file the
+driving test then reads back. It is how the input slice proves a byte-diverse
+corpus — printable UTF-8, control bytes, Cyrillic/CJK/emoji — arrives
+byte-identically end to end.
+
+It brackets the capture with two markers on stdout so a driver can sequence
+its injection without a wall-clock race (both are `package scriptedagent`
+constants):
+
+- `shevet-read-raw-ready` (`ReadRawReady`) — printed **after** raw mode is
+  active. Wait for it on the rendered screen before injecting; only then are
+  the bytes guaranteed to arrive un-cooked.
+- `shevet-read-raw-done` (`ReadRawDone`) — printed once all `count` bytes are
+  captured and the file is written. Wait for it, then read the file.
+
+`read-raw` needs a real terminal (the pty of a tmux pane); it errors if stdin
+is a pipe. `path` runs to the end of the line, so it may contain spaces.
 
 A script that ends without `exit` terminates with code 0. If stdin closes
 while parked on `await-line` (the driver went away), the agent exits

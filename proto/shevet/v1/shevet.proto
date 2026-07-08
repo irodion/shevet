@@ -26,6 +26,15 @@ service HerdService {
   // (a resize followed by damage covering every non-default cell); after
   // that, damage carries only cells that changed — never full frames.
   rpc WatchPane(WatchPaneRequest) returns (stream PaneUpdate);
+
+  // SendInput is the Control Input stream (Client -> Server): a long-lived
+  // stream of input events for the Panes the Client drives. Each event
+  // carries raw, already-encoded terminal bytes, which the Server injects
+  // into the target Pane exactly (printable UTF-8 literally, control bytes
+  // by hex — see the injector). The summary is returned when the Client
+  // half-closes the stream. Later slices add focus, resize, paste, and
+  // mouse events to InputEvent additively.
+  rpc SendInput(stream InputEvent) returns (SendInputSummary);
 }
 
 message ListPanesRequest {}
@@ -111,3 +120,35 @@ message PaneResized {
 // PaneExited reports that the Pane left the Herd (its process ended or the
 // window closed). It is the stream's final update.
 message PaneExited {}
+
+// InputEvent is one event on the Control Input stream. The oneof is declared
+// additive: this slice carries keystrokes; focus acquisition, resize, paste,
+// and mouse events join it in later slices without breaking the wire.
+message InputEvent {
+  oneof event {
+    KeyBytes keys = 1;
+  }
+}
+
+// KeyBytes is raw, already-encoded input destined for one Pane. The Client
+// re-encodes keystrokes to exact terminal bytes; the Server injects them
+// verbatim. data is opaque bytes — never interpreted as text on the wire —
+// so control sequences, multi-byte UTF-8, and NUL all survive intact.
+message KeyBytes {
+  // pane_id identifies the target Pane, as returned by ListPanes.
+  string pane_id = 1;
+
+  // data is the exact byte sequence to inject into the Pane.
+  bytes data = 2;
+}
+
+// SendInputSummary reports what a Control Input stream delivered, returned
+// when the Client half-closes it. It is a diagnostic acknowledgement, not a
+// per-event ack: input is fire-and-forward for typing latency.
+message SendInputSummary {
+  // events is the number of input events the Server accepted.
+  uint64 events = 1;
+
+  // bytes is the total number of input bytes injected.
+  uint64 bytes = 2;
+}

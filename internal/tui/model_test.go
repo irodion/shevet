@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -36,6 +38,9 @@ type fakeConn struct {
 	stream   *fakeStream
 	watchErr error
 
+	sink     *fakeSink
+	inputErr error
+
 	watched []string
 }
 
@@ -49,6 +54,43 @@ func (f *fakeConn) WatchPane(_ context.Context, paneID string) (PaneStream, erro
 		return nil, f.watchErr
 	}
 	return f.stream, nil
+}
+
+func (f *fakeConn) SendInput(context.Context) (InputSink, error) {
+	if f.inputErr != nil {
+		return nil, f.inputErr
+	}
+	if f.sink == nil {
+		f.sink = &fakeSink{}
+	}
+	return f.sink, nil
+}
+
+// fakeSink records the keystrokes forwarded through it, guarded because the
+// forwarder writes from its own goroutine while the test reads.
+type fakeSink struct {
+	mu      sync.Mutex
+	pane    string
+	keys    []byte
+	sendErr error
+}
+
+func (s *fakeSink) SendKeys(paneID string, data []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sendErr != nil {
+		return s.sendErr
+	}
+	s.pane = paneID
+	s.keys = append(s.keys, data...)
+	return nil
+}
+
+// received returns the bytes forwarded so far.
+func (s *fakeSink) received() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]byte(nil), s.keys...)
 }
 
 // pump runs one command and folds its message into the model, the way the
@@ -202,5 +244,168 @@ func TestWatch_StreamErrorSurfaces(t *testing.T) {
 
 	if got := viewContent(m); !strings.Contains(got, "stream torn") {
 		t.Errorf("view does not surface the stream error:\n%q", got)
+	}
+}
+
+// liveModel watches %1 with a single resize update, leaving a read-only view
+// of a sized, live Pane — the state passthrough is entered from.
+func liveModel(t *testing.T) (Model, *fakeConn) {
+	t.Helper()
+	return watchingModel(t, []client.PaneUpdate{{Resized: &grid.Size{W: 10, H: 3}}})
+}
+
+// enterFocus presses 'i' and drives the input-stream open to completion,
+// returning a model in passthrough with its forwarder ready.
+func enterFocus(t *testing.T, m Model) Model {
+	t.Helper()
+	next, cmd := m.Update(tea.KeyPressMsg{Code: 'i', Text: "i"})
+	m = next.(Model)
+	if !m.focused {
+		t.Fatal("pressing 'i' on a live Pane did not enter passthrough")
+	}
+	if cmd == nil {
+		t.Fatal("entering passthrough did not open the input stream")
+	}
+	next, _ = m.Update(cmd()) // inputReadyMsg
+	m = next.(Model)
+	if m.fwd == nil {
+		t.Fatalf("passthrough forwarder not ready: %v", m.inputErr)
+	}
+	return m
+}
+
+// press feeds one key and returns the updated model and command.
+func press(t *testing.T, m Model, key tea.KeyPressMsg) (Model, tea.Cmd) {
+	t.Helper()
+	next, cmd := m.Update(key)
+	return next.(Model), cmd
+}
+
+// waitKeys waits for the sink to have received exactly want.
+func waitKeys(t *testing.T, sink *fakeSink, want string) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		if string(sink.received()) == want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("forwarded %q, want %q", sink.received(), want)
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
+func TestFocus_ForwardsEncodedKeystrokes(t *testing.T) {
+	m, conn := liveModel(t)
+	m = enterFocus(t, m)
+
+	// Type a mix that crosses the encoder's paths: text, Enter, an arrow.
+	for _, k := range []tea.KeyPressMsg{
+		{Code: 'h', Text: "h"},
+		{Code: 'i', Text: "i"},
+		{Code: tea.KeyEnter},
+		{Code: tea.KeyUp},
+	} {
+		m, _ = press(t, m, k)
+	}
+	waitKeys(t, conn.sink, "hi\r\x1b[A")
+	if conn.sink.pane != "%1" {
+		t.Errorf("forwarded to pane %q, want %%1", conn.sink.pane)
+	}
+}
+
+func TestFocus_CtrlCForwardsInsteadOfQuitting(t *testing.T) {
+	m, conn := liveModel(t)
+	m = enterFocus(t, m)
+
+	_, cmd := press(t, m, tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	if cmd != nil {
+		if _, ok := cmd().(tea.QuitMsg); ok {
+			t.Fatal("Ctrl-C quit the dashboard while in passthrough, want it forwarded")
+		}
+	}
+	waitKeys(t, conn.sink, "\x03")
+}
+
+func TestFocus_LeaderReturnsToReadOnly(t *testing.T) {
+	m, _ := liveModel(t)
+	m = enterFocus(t, m)
+
+	m, _ = press(t, m, tea.KeyPressMsg{Code: '\\', Mod: tea.ModCtrl}) // Ctrl-\
+	if m.focused {
+		t.Fatal("the leader did not return from passthrough")
+	}
+	// Back in read-only, 'q' quits again.
+	_, cmd := press(t, m, tea.KeyPressMsg{Code: 'q', Text: "q"})
+	if cmd == nil {
+		t.Fatal("'q' produced no command in read-only")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Fatalf("'q' produced %T, want tea.QuitMsg", cmd())
+	}
+}
+
+func TestFocus_QueuesKeystrokesUntilStreamOpens(t *testing.T) {
+	m, conn := liveModel(t)
+
+	// Enter passthrough but hold the stream open in-flight.
+	m, openCmd := press(t, m, tea.KeyPressMsg{Code: 'i', Text: "i"})
+	if openCmd == nil {
+		t.Fatal("entering passthrough did not open the input stream")
+	}
+
+	// A keystroke typed before the stream is ready must be queued, not lost.
+	m, _ = press(t, m, tea.KeyPressMsg{Code: 'x', Text: "x"})
+	if len(m.pending) != 1 {
+		t.Fatalf("pending = %d keystrokes, want 1 buffered before the stream opened", len(m.pending))
+	}
+
+	// Once the stream opens, the queue flushes in order.
+	next, _ := m.Update(openCmd()) // inputReadyMsg -> flush
+	m = next.(Model)
+	waitKeys(t, conn.sink, "x")
+	if len(m.pending) != 0 {
+		t.Errorf("pending not cleared after flush: %d", len(m.pending))
+	}
+}
+
+func TestFocus_UnavailableWhenInputStreamFails(t *testing.T) {
+	conn := &fakeConn{
+		panes:    []herd.Pane{{ID: "%1"}},
+		stream:   &fakeStream{updates: []client.PaneUpdate{{Resized: &grid.Size{W: 10, H: 3}}}},
+		inputErr: errors.New("input stream refused"),
+	}
+	m, cmd := loadedModel(t, conn)
+	m, cmd = pump(t, m, cmd) // watchStarted -> recv
+	m, _ = pump(t, m, cmd)   // resize update
+
+	m, cmd = press(t, m, tea.KeyPressMsg{Code: 'i', Text: "i"})
+	next, _ := m.Update(cmd()) // inputFailedMsg
+	m = next.(Model)
+
+	if m.focused {
+		t.Error("stayed in passthrough despite the input stream failing")
+	}
+	if m.inputErr == nil {
+		t.Error("input failure was not recorded")
+	}
+	// 'q' quits again, since passthrough dropped back to read-only.
+	_, cmd = press(t, m, tea.KeyPressMsg{Code: 'q', Text: "q"})
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Fatal("read-only 'q' no longer quits after input failure")
+	}
+}
+
+func TestFocus_IgnoredWithoutALivePane(t *testing.T) {
+	// Empty Herd: nothing to type into, so 'i' must not enter passthrough.
+	m, _ := loadedModel(t, &fakeConn{})
+	m, cmd := press(t, m, tea.KeyPressMsg{Code: 'i', Text: "i"})
+	if m.focused {
+		t.Error("entered passthrough with no live Pane on screen")
+	}
+	if cmd != nil {
+		t.Errorf("opened an input stream with no Pane, cmd=%T", cmd())
 	}
 }
