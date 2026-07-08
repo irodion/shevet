@@ -46,7 +46,7 @@ func (c *Conn) DialStreamLocal(remotePath string) (net.Conn, error) {
 		return nil, fmt.Errorf("sshx: open streamlocal channel to %s: %w", remotePath, err)
 	}
 	go ssh.DiscardRequests(reqs)
-	return &streamConn{Channel: ch, addr: c.cfg.addr(), path: remotePath}, nil
+	return &streamConn{Channel: ch, sshConnBase: sshConnBase{addr: c.cfg.addr()}, path: remotePath}, nil
 }
 
 // DialCommand runs argv on the Host and returns its stdio as a net.Conn:
@@ -69,7 +69,7 @@ func (c *Conn) DialCommand(argv []string) (net.Conn, error) {
 		sess.Close() //nolint:errcheck // failed setup
 		return nil, fmt.Errorf("sshx: pipe stdout: %w", err)
 	}
-	conn := &cmdConn{sess: sess, stdin: stdin, stdout: stdout, addr: c.cfg.addr(), cmd: strings.Join(argv, " ")}
+	conn := &cmdConn{sshConnBase: sshConnBase{addr: c.cfg.addr()}, sess: sess, stdin: stdin, stdout: stdout, cmd: strings.Join(argv, " ")}
 	sess.Stderr = &conn.stderr
 
 	if err := sess.Start(shellQuote(argv)); err != nil {
@@ -121,28 +121,34 @@ type sshAddr struct{ network, addr string }
 func (a sshAddr) Network() string { return a.network }
 func (a sshAddr) String() string  { return a.addr }
 
-// streamConn adapts an ssh.Channel to net.Conn. The SSH channel has no
-// deadline concept, so the deadline setters are no-ops; gRPC's own keepalive
-// and per-RPC timeouts govern liveness.
+// sshConnBase supplies the net.Conn addressing and deadline methods shared by
+// every stream on the SSH connection. The streams have no deadline concept —
+// the setters are no-ops and gRPC's own keepalive and per-RPC timeouts govern
+// liveness — and their local address is synthetic. RemoteAddr differs per
+// stream, so each embedding type provides its own.
+type sshConnBase struct{ addr string }
+
+func (b sshConnBase) LocalAddr() net.Addr            { return sshAddr{"ssh", b.addr} }
+func (sshConnBase) SetDeadline(time.Time) error      { return nil }
+func (sshConnBase) SetReadDeadline(time.Time) error  { return nil }
+func (sshConnBase) SetWriteDeadline(time.Time) error { return nil }
+
+// streamConn adapts an ssh.Channel to net.Conn.
 type streamConn struct {
 	ssh.Channel
-	addr string
+	sshConnBase
 	path string
 }
 
-func (c *streamConn) LocalAddr() net.Addr              { return sshAddr{"ssh", c.addr} }
-func (c *streamConn) RemoteAddr() net.Addr             { return sshAddr{"unix", c.path} }
-func (c *streamConn) SetDeadline(time.Time) error      { return nil }
-func (c *streamConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *streamConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *streamConn) RemoteAddr() net.Addr { return sshAddr{"unix", c.path} }
 
 // cmdConn adapts a remote command's stdio to net.Conn.
 type cmdConn struct {
+	sshConnBase
 	sess   *ssh.Session
 	stdin  io.WriteCloser
 	stdout io.Reader
 	stderr syncBuffer
-	addr   string
 	cmd    string
 
 	waitOnce sync.Once
@@ -195,11 +201,7 @@ func (c *cmdConn) Err() error {
 	return c.waitErr
 }
 
-func (c *cmdConn) LocalAddr() net.Addr              { return sshAddr{"ssh", c.addr} }
-func (c *cmdConn) RemoteAddr() net.Addr             { return sshAddr{"exec", c.cmd} }
-func (c *cmdConn) SetDeadline(time.Time) error      { return nil }
-func (c *cmdConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *cmdConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *cmdConn) RemoteAddr() net.Addr { return sshAddr{"exec", c.cmd} }
 
 // syncBuffer is a tiny concurrency-safe buffer for capturing remote stderr,
 // which the ssh library writes from its own goroutine.

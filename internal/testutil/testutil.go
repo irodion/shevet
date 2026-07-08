@@ -2,6 +2,7 @@
 package testutil
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,6 +11,26 @@ import (
 	"testing"
 	"time"
 )
+
+// SyncBuffer is a concurrency-safe buffer for capturing output that a test
+// writes from one goroutine (a copy pump, an slog handler) and reads from
+// another. Its zero value is ready to use.
+type SyncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *SyncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *SyncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 // WaitTimeout bounds every cross-process wait in the test suite. Polling is
 // legitimate only at a process boundary (tmux, spawned binaries); in-process

@@ -1,7 +1,6 @@
 package e2e
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,7 +9,6 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/creack/pty"
@@ -217,7 +215,7 @@ func TestSSH_ConnectBinaryEndToEnd(t *testing.T) {
 		t.Fatalf("set pty size: %v", err)
 	}
 	connect.Stdin, connect.Stdout = tty, tty
-	var stderr safeBuffer
+	var stderr testutil.SyncBuffer
 	connect.Stderr = &stderr
 	if err := connect.Start(); err != nil {
 		t.Fatalf("start connect: %v", err)
@@ -230,29 +228,7 @@ func TestSSH_ConnectBinaryEndToEnd(t *testing.T) {
 		}
 	})
 
-	var (
-		mu  sync.Mutex
-		out strings.Builder
-	)
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, err := ptmx.Read(buf)
-			if n > 0 {
-				mu.Lock()
-				out.Write(buf[:n])
-				mu.Unlock()
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-	snapshot := func() string {
-		mu.Lock()
-		defer mu.Unlock()
-		return out.String()
-	}
+	snapshot := ptySnapshot(ptmx)
 
 	testutil.Eventually(t, `dashboard to render "0 Panes" over SSH`, func() (bool, string) {
 		s := snapshot()
@@ -280,7 +256,7 @@ func connectVia(t *testing.T, srv *sshdServer, bin, socket string, opts clientCo
 	t.Helper()
 
 	configFile := writeClientConfig(t, srv, opts)
-	var log safeBuffer
+	var log testutil.SyncBuffer
 	logger := slog.New(slog.NewTextHandler(&log, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	c, err := client.DialSSH(context.Background(), opts.alias, client.SSHOptions{
@@ -368,23 +344,4 @@ func assertNoTCPListeners(t *testing.T, pid int) {
 	if listeners := strings.TrimSpace(string(out)); listeners != "" {
 		t.Errorf("process %d holds TCP listeners (want none):\n%s", pid, listeners)
 	}
-}
-
-// safeBuffer is a concurrency-safe buffer: the transport logs from gRPC's dial
-// goroutine while the test reads.
-type safeBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *safeBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *safeBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
 }

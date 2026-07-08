@@ -3,6 +3,7 @@ package sshx
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -42,7 +43,7 @@ globalknownhostsfile /etc/ssh/ssh_known_hosts
 		filepath.Join(home, ".ssh/id_ed25519"),
 		filepath.Join(home, ".ssh/id_rsa"),
 	}
-	if !equal(cfg.IdentityFiles, wantIDs) {
+	if !slices.Equal(cfg.IdentityFiles, wantIDs) {
 		t.Errorf("IdentityFiles = %v, want %v", cfg.IdentityFiles, wantIDs)
 	}
 	wantKH := []string{
@@ -50,7 +51,7 @@ globalknownhostsfile /etc/ssh/ssh_known_hosts
 		filepath.Join(home, ".ssh/known_hosts2"),
 		"/etc/ssh/ssh_known_hosts",
 	}
-	if !equal(cfg.KnownHostsFiles, wantKH) {
+	if !slices.Equal(cfg.KnownHostsFiles, wantKH) {
 		t.Errorf("KnownHostsFiles = %v, want %v", cfg.KnownHostsFiles, wantKH)
 	}
 	if cfg.addr() != "10.0.0.7:2200" {
@@ -89,16 +90,4 @@ func TestConfigStrict(t *testing.T) {
 			t.Errorf("strict(%q) = %v, want %v", value, got, wantStrict)
 		}
 	}
-}
-
-func equal(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }

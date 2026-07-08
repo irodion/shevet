@@ -54,8 +54,8 @@ type Conn struct {
 // (wrapped) for the two failures a user can act on; other failures (network,
 // protocol) are returned as-is.
 func Dial(ctx context.Context, cfg *Config) (*Conn, error) {
-	auth := authMethods(cfg)
-	defer auth.close()
+	methods, closeAuth := authMethods(cfg)
+	defer closeAuth()
 
 	hostKey, err := hostKeyCallback(cfg)
 	if err != nil {
@@ -64,7 +64,7 @@ func Dial(ctx context.Context, cfg *Config) (*Conn, error) {
 
 	clientCfg := &ssh.ClientConfig{
 		User:            cfg.User,
-		Auth:            auth.methods,
+		Auth:            methods,
 		HostKeyCallback: hostKey,
 		Timeout:         handshakeTimeout,
 	}
@@ -105,20 +105,13 @@ func classifyHandshake(cfg *Config, err error) error {
 	}
 }
 
-// authResult bundles the auth methods with a cleanup for the agent socket,
-// which must stay open across the handshake because the agent signs there.
-type authResult struct {
-	methods []ssh.AuthMethod
-	close   func()
-}
-
 // authMethods assembles public-key auth from the ssh-agent and any usable
-// identity files. "No keys" is not an error here: it surfaces later as ErrAuth
-// from the server, with the full list of methods tried — a more honest message
-// than guessing up front.
-func authMethods(cfg *Config) authResult {
+// identity files. It returns a closer for the agent socket, which must stay
+// open across the handshake because the agent signs there. "No keys" is not an
+// error: it surfaces later as ErrAuth from the server, with the full list of
+// methods tried — a more honest message than guessing up front.
+func authMethods(cfg *Config) ([]ssh.AuthMethod, func()) {
 	agentSigners, closeAgent := loadAgentSigners()
-	res := authResult{close: closeAgent}
 	fileSigners := loadIdentityFiles(cfg.IdentityFiles)
 
 	// IdentitiesOnly=yes means "don't offer agent keys the user didn't list".
@@ -130,10 +123,10 @@ func authMethods(cfg *Config) authResult {
 	}
 
 	signers := dedupeSigners(append(fileSigners, agentSigners...))
-	if len(signers) > 0 {
-		res.methods = append(res.methods, ssh.PublicKeys(signers...))
+	if len(signers) == 0 {
+		return nil, closeAgent
 	}
-	return res
+	return []ssh.AuthMethod{ssh.PublicKeys(signers...)}, closeAgent
 }
 
 // loadAgentSigners returns the signers held by the running ssh-agent, or nil

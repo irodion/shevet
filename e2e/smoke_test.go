@@ -120,6 +120,13 @@ func startConnectPTY(t *testing.T, bin, socket string) (*exec.Cmd, *os.File, fun
 		}
 	})
 
+	return connect, ptmx, ptySnapshot(ptmx)
+}
+
+// ptySnapshot drains ptmx in the background into a buffer and returns a
+// function reporting everything read so far — the accumulating view a test
+// asserts the dashboard rendered.
+func ptySnapshot(ptmx *os.File) func() string {
 	var (
 		mu  sync.Mutex
 		out strings.Builder
@@ -138,12 +145,11 @@ func startConnectPTY(t *testing.T, bin, socket string) (*exec.Cmd, *os.File, fun
 			}
 		}
 	}()
-	snapshot := func() string {
+	return func() string {
 		mu.Lock()
 		defer mu.Unlock()
 		return out.String()
 	}
-	return connect, ptmx, snapshot
 }
 
 // waitFor waits for cmd to exit successfully within the timeout.

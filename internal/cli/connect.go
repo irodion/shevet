@@ -58,7 +58,11 @@ func runConnect(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		fmt.Fprintf(stderr, "shevet connect: warning: %s (%s)\n", nonBootVolumeWarning, path)
 	}
 
-	c, err := dialTarget(ctx, host, *socket, sshTarget{remoteSocket: *remoteSocket, configFile: *sshConfig}, logLevel, stderr)
+	c, err := dialTarget(ctx, host, *socket, client.SSHOptions{
+		RemoteSocket: *remoteSocket,
+		ConfigFile:   *sshConfig,
+		Logger:       slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: logLevel})),
+	})
 	if err != nil {
 		fmt.Fprintf(stderr, "shevet connect: %s\n", connectAdvice(err))
 		return exitError
@@ -72,23 +76,11 @@ func runConnect(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	return exitOK
 }
 
-// sshTarget carries the SSH-only connect options past dialTarget's transport
-// switch.
-type sshTarget struct {
-	remoteSocket string
-	configFile   string
-}
-
 // dialTarget picks the transport from the parsed target: a remote Host over
-// SSH, or a local unix socket.
-func dialTarget(ctx context.Context, host, socket string, ssh sshTarget, logLevel slog.Level, stderr io.Writer) (*client.Client, error) {
+// SSH (using sshOpts), or a local unix socket.
+func dialTarget(ctx context.Context, host, socket string, sshOpts client.SSHOptions) (*client.Client, error) {
 	if host != "" {
-		log := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: logLevel}))
-		return client.DialSSH(ctx, host, client.SSHOptions{
-			RemoteSocket: ssh.remoteSocket,
-			ConfigFile:   ssh.configFile,
-			Logger:       log,
-		})
+		return client.DialSSH(ctx, host, sshOpts)
 	}
 	return client.Dial(socket)
 }

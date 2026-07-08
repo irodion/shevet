@@ -37,9 +37,9 @@ func TestProxyPump(t *testing.T) {
 	}()
 
 	inR, inW := io.Pipe()
-	var out strings.Builder
+	var out testutil.SyncBuffer
 	done := make(chan error, 1)
-	go func() { done <- proxyPump(context.Background(), inR, &syncWriter{w: &out}, socket) }()
+	go func() { done <- proxyPump(context.Background(), inR, &out, socket) }()
 
 	if _, err := inW.Write([]byte("hello over ssh")); err != nil {
 		t.Fatalf("write stdin: %v", err)
@@ -99,19 +99,6 @@ func TestDescribeDialError(t *testing.T) {
 	if got := describeDialError(errors.New("plain")); got.Error() != "plain" {
 		t.Errorf("unknown error rewritten to %q, want passthrough", got)
 	}
-}
-
-// syncWriter guards a strings.Builder written from the pump's copy goroutine
-// and read by the test.
-type syncWriter struct {
-	mu sync.Mutex
-	w  *strings.Builder
-}
-
-func (s *syncWriter) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.w.Write(p)
 }
 
 // blockingReader never returns from Read until the process exits, modeling an
