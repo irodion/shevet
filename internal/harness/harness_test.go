@@ -9,9 +9,11 @@ import (
 	"github.com/irodion/shevet/internal/tmuxtest"
 )
 
-// TestHarness_ServeAndEmptyHerd is the acceptance test of issue #7: real
-// tmux sandbox + running Server + gRPC client, asserting the empty Herd.
-func TestHarness_ServeAndEmptyHerd(t *testing.T) {
+// TestHarness_ServeAndListPanes is the composed-harness acceptance test
+// (issue #7, updated when the Server grew its tmux attachment in #8): real
+// tmux sandbox + running Server + gRPC client. The Herd mirrors the sandbox
+// session, whose only initial pane is the holder.
+func TestHarness_ServeAndListPanes(t *testing.T) {
 	t.Parallel()
 	h := Start(t)
 
@@ -22,8 +24,8 @@ func TestHarness_ServeAndEmptyHerd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListPanes: %v", err)
 	}
-	if len(panes) != 0 {
-		t.Errorf("ListPanes returned %d panes, want 0", len(panes))
+	if len(panes) != 1 {
+		t.Fatalf("ListPanes returned %d panes, want 1 (the sandbox holder)", len(panes))
 	}
 }
 

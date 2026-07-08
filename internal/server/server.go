@@ -26,6 +26,11 @@ type Options struct {
 	// SocketPath is the unix socket the gRPC server listens on.
 	// Required; see paths.DefaultSocket for the conventional location.
 	SocketPath string
+
+	// Tmux, when non-nil, attaches the Server to a tmux session whose
+	// panes become the Herd. Nil serves an empty Herd (useful for tests
+	// and for hosts where the session is created later).
+	Tmux *TmuxOptions
 }
 
 // Server serves the shevet.v1 API for one Host.
@@ -33,6 +38,7 @@ type Options struct {
 type Server struct {
 	opts     Options
 	registry *Registry
+	hub      *paneHub
 	log      *slog.Logger
 	lis      net.Listener
 }
@@ -42,6 +48,7 @@ func New(opts Options, log *slog.Logger) *Server {
 	return &Server{
 		opts:     opts,
 		registry: NewRegistry(),
+		hub:      newPaneHub(),
 		log:      log,
 	}
 }
@@ -73,8 +80,36 @@ func (s *Server) Serve(ctx context.Context) error {
 	// braces cleanup for the paths where Close is not reached.
 	defer os.Remove(s.opts.SocketPath) //nolint:errcheck // best-effort cleanup
 
+	// The watcher's lifetime nests inside Serve: canceled with ctx, and
+	// its pipelines are closed before Serve returns (watcher.run's defer),
+	// which in turn releases any WatchPane handlers GracefulStop waits on.
+	if s.opts.Tmux != nil {
+		watchCtx, stopWatcher := context.WithCancel(ctx)
+		w, err := attachWatcher(watchCtx, *s.opts.Tmux, s.registry, s.hub, s.log)
+		if err != nil {
+			stopWatcher()
+			return fmt.Errorf("attach to tmux: %w", err)
+		}
+		watcherDone := make(chan struct{})
+		go func() {
+			defer close(watcherDone)
+			if err := w.run(watchCtx); err != nil {
+				// The Server outlives its tmux attachment: it keeps
+				// serving an empty Herd so Clients see the outage rather
+				// than a vanished endpoint. Reattach is the resilience
+				// slice's business.
+				s.log.Error("tmux watcher stopped", "error", err)
+			}
+		}()
+		defer func() {
+			stopWatcher()
+			<-watcherDone // watcher teardown (pipelines, tmux client) completes before Serve returns
+		}()
+		s.log.Info("watching tmux session", "session", s.opts.Tmux.Session, "tmux_socket", s.opts.Tmux.Socket)
+	}
+
 	grpcServer := grpc.NewServer()
-	shevetv1.RegisterHerdServiceServer(grpcServer, newHerdService(s.registry))
+	shevetv1.RegisterHerdServiceServer(grpcServer, newHerdService(s.registry, s.hub))
 
 	s.log.Info("server listening", "socket", s.opts.SocketPath)
 

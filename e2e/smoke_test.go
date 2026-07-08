@@ -25,10 +25,12 @@ import (
 
 // startServe launches `shevet serve` and waits until its socket accepts
 // connections. It returns the running command; the caller owns shutdown.
-func startServe(t *testing.T, bin, socket string) *exec.Cmd {
+func startServe(t *testing.T, bin, socket string, extraArgs ...string) *exec.Cmd {
 	t.Helper()
 
-	cmd := exec.Command(bin, "serve", "--socket", socket)
+	// t.Context is canceled before cleanups run: a process still alive at
+	// test end is killed even if an assertion bailed out early.
+	cmd := exec.CommandContext(t.Context(), bin, append([]string{"serve", "--socket", socket}, extraArgs...)...)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start serve: %v", err)
@@ -75,16 +77,49 @@ func TestSmoke_ConnectRendersEmptyHerdAndQuits(t *testing.T) {
 	socket := testutil.SocketPath(t)
 	serve := startServe(t, bin, socket)
 
-	connect := exec.Command(bin, "connect", "--socket", socket)
+	connect, ptmx, snapshot := startConnectPTY(t, bin, socket)
+
+	testutil.Eventually(t, `dashboard to render "0 Panes"`, func() (bool, string) {
+		s := snapshot()
+		return strings.Contains(s, "0 Panes"), fmt.Sprintf("%q", s)
+	})
+
+	if _, err := ptmx.WriteString("q"); err != nil {
+		t.Fatalf("send quit key: %v", err)
+	}
+	if err := waitFor(connect, testutil.WaitTimeout); err != nil {
+		t.Fatalf("connect did not exit cleanly after quit: %v", err)
+	}
+
+	if err := serve.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("SIGTERM serve: %v", err)
+	}
+	if err := waitFor(serve, testutil.WaitTimeout); err != nil {
+		t.Fatalf("serve did not exit cleanly: %v", err)
+	}
+}
+
+// startConnectPTY runs `shevet connect` on a real PTY and returns the
+// command, the PTY master, and a snapshot function accumulating everything
+// the dashboard has drawn.
+func startConnectPTY(t *testing.T, bin, socket string) (*exec.Cmd, *os.File, func() string) {
+	t.Helper()
+
+	connect := exec.CommandContext(t.Context(), bin, "connect", "--socket", socket)
 	connect.Env = append(os.Environ(), "TERM=xterm-256color")
 
 	ptmx, err := pty.StartWithSize(connect, &pty.Winsize{Rows: 24, Cols: 80})
 	if err != nil {
 		t.Fatalf("start connect on PTY: %v", err)
 	}
-	defer ptmx.Close() //nolint:errcheck // PTY teardown
+	t.Cleanup(func() {
+		ptmx.Close() //nolint:errcheck // PTY teardown
+		if connect.ProcessState == nil {
+			connect.Process.Kill() //nolint:errcheck // last-resort cleanup
+			connect.Wait()         //nolint:errcheck
+		}
+	})
 
-	// Accumulate PTY output until the dashboard shows the empty Herd.
 	var (
 		mu  sync.Mutex
 		out strings.Builder
@@ -108,25 +143,7 @@ func TestSmoke_ConnectRendersEmptyHerdAndQuits(t *testing.T) {
 		defer mu.Unlock()
 		return out.String()
 	}
-
-	testutil.Eventually(t, `dashboard to render "0 Panes"`, func() (bool, string) {
-		s := snapshot()
-		return strings.Contains(s, "0 Panes"), fmt.Sprintf("%q", s)
-	})
-
-	if _, err := ptmx.WriteString("q"); err != nil {
-		t.Fatalf("send quit key: %v", err)
-	}
-	if err := waitFor(connect, testutil.WaitTimeout); err != nil {
-		t.Fatalf("connect did not exit cleanly after quit: %v", err)
-	}
-
-	if err := serve.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatalf("SIGTERM serve: %v", err)
-	}
-	if err := waitFor(serve, testutil.WaitTimeout); err != nil {
-		t.Fatalf("serve did not exit cleanly: %v", err)
-	}
+	return connect, ptmx, snapshot
 }
 
 // waitFor waits for cmd to exit successfully within the timeout.

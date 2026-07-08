@@ -1,8 +1,9 @@
 // Package tui implements the Client dashboard: the Bubble Tea program run by
 // `shevet connect` (docs/adr/0002-pure-go-tui-bubbletea-v2.md).
 //
-// In this slice the dashboard shows the size of the Herd and quits on demand;
-// the Pane grid widget arrives in a later slice.
+// In this slice the dashboard shows one live Pane: it watches the first Pane
+// in the Herd full-screen, read-only. The Pane grid widget with navigation
+// arrives with the dashboard slice.
 package tui
 
 import (
@@ -14,6 +15,8 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
+	"github.com/irodion/shevet/internal/client"
+	"github.com/irodion/shevet/internal/grid"
 	"github.com/irodion/shevet/internal/herd"
 )
 
@@ -21,29 +24,58 @@ import (
 // an on-screen error instead of a silently empty dashboard.
 const fetchTimeout = 5 * time.Second
 
-// PaneLister fetches the Herd from a Server. *client.Client implements it;
-// tests substitute fakes.
-type PaneLister interface {
+// PaneStream is a live render stream for one Pane, as the dashboard
+// consumes it. *client.PaneWatch implements it.
+type PaneStream interface {
+	Recv() (client.PaneUpdate, error)
+}
+
+// Conn is the dashboard's view of a Server connection. *client.Client is
+// adapted by Run; tests substitute fakes.
+type Conn interface {
 	ListPanes(ctx context.Context) ([]herd.Pane, error)
+	WatchPane(ctx context.Context, paneID string) (PaneStream, error)
+}
+
+// clientConn adapts *client.Client to Conn (its WatchPane returns the
+// concrete stream type).
+type clientConn struct{ c *client.Client }
+
+func (cc clientConn) ListPanes(ctx context.Context) ([]herd.Pane, error) {
+	return cc.c.ListPanes(ctx) //nolint:wrapcheck // pure adapter
+}
+
+func (cc clientConn) WatchPane(ctx context.Context, paneID string) (PaneStream, error) {
+	return cc.c.WatchPane(ctx, paneID) //nolint:wrapcheck // pure adapter
 }
 
 // Model is the dashboard's Bubble Tea model. Construct with New.
 type Model struct {
-	lister PaneLister
+	conn Conn
+
+	// ctx bounds the connection's streams; commands dial with it so
+	// quitting the program tears the watch down.
+	ctx context.Context
 
 	panes  []herd.Pane
 	loaded bool
 	err    error
+
+	// The watched Pane, once one is picked from the Herd; view folds the
+	// render stream into the local grid.
+	watching *herd.Pane
+	stream   PaneStream
+	view     *client.PaneView
 }
 
-// New returns a dashboard Model that will populate itself from lister.
-func New(lister PaneLister) Model {
-	return Model{lister: lister}
+// New returns a dashboard Model that will populate itself from conn.
+func New(ctx context.Context, conn Conn) Model {
+	return Model{conn: conn, ctx: ctx}
 }
 
 // Run drives the dashboard to completion on the caller's terminal.
-func Run(ctx context.Context, lister PaneLister) error {
-	program := tea.NewProgram(New(lister), tea.WithContext(ctx))
+func Run(ctx context.Context, c *client.Client) error {
+	program := tea.NewProgram(New(ctx, clientConn{c: c}), tea.WithContext(ctx))
 	if _, err := program.Run(); err != nil {
 		return fmt.Errorf("run dashboard: %w", err)
 	}
@@ -54,19 +86,25 @@ type panesLoadedMsg []herd.Pane
 
 type loadFailedMsg struct{ err error }
 
+type watchStartedMsg struct{ stream PaneStream }
+
+type paneUpdateMsg client.PaneUpdate
+
+type watchFailedMsg struct{ err error }
+
 // Init kicks off the initial Herd fetch.
 func (m Model) Init() tea.Cmd {
-	return fetchPanesCmd(m.lister)
+	return fetchPanesCmd(m.ctx, m.conn)
 }
 
-// fetchPanesCmd closes over only the lister, not the whole Model — commands
-// outlive the Model value that issued them, and should not carry it.
-func fetchPanesCmd(lister PaneLister) tea.Cmd {
+// fetchPanesCmd closes over only what it needs, not the whole Model —
+// commands outlive the Model value that issued them, and should not carry it.
+func fetchPanesCmd(ctx context.Context, conn Conn) tea.Cmd {
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
+		ctx, cancel := context.WithTimeout(ctx, fetchTimeout)
 		defer cancel()
 
-		panes, err := lister.ListPanes(ctx)
+		panes, err := conn.ListPanes(ctx)
 		if err != nil {
 			return loadFailedMsg{err: err}
 		}
@@ -74,7 +112,30 @@ func fetchPanesCmd(lister PaneLister) tea.Cmd {
 	}
 }
 
-// Update handles messages: quit keys and fetch results.
+// watchPaneCmd opens the render stream for the chosen Pane.
+func watchPaneCmd(ctx context.Context, conn Conn, paneID string) tea.Cmd {
+	return func() tea.Msg {
+		stream, err := conn.WatchPane(ctx, paneID)
+		if err != nil {
+			return watchFailedMsg{err: err}
+		}
+		return watchStartedMsg{stream: stream}
+	}
+}
+
+// recvCmd waits for the next update on the stream. Update re-issues it
+// after every received message, forming the receive loop.
+func recvCmd(stream PaneStream) tea.Cmd {
+	return func() tea.Msg {
+		u, err := stream.Recv()
+		if err != nil {
+			return watchFailedMsg{err: err}
+		}
+		return paneUpdateMsg(u)
+	}
+}
+
+// Update handles messages: quit keys, fetch results, and the render stream.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
@@ -82,13 +143,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		}
+
 	case panesLoadedMsg:
 		m.panes = msg
 		m.loaded = true
 		m.err = nil
+		// This slice views one Pane: the Herd's first. The grid dashboard
+		// slice replaces this with navigation.
+		if len(m.panes) > 0 {
+			pane := m.panes[0]
+			m.watching = &pane
+			return m, watchPaneCmd(m.ctx, m.conn, pane.ID)
+		}
+
 	case loadFailedMsg:
 		m.err = msg.err
 		m.loaded = true
+
+	case watchStartedMsg:
+		m.stream = msg.stream
+		m.view = client.NewPaneView()
+		return m, recvCmd(m.stream)
+
+	case paneUpdateMsg:
+		m.view.Apply(client.PaneUpdate(msg))
+		if m.view.Exited {
+			return m, nil // stream is over; the Server sends nothing after exited
+		}
+		return m, recvCmd(m.stream)
+
+	case watchFailedMsg:
+		m.err = msg.err
 	}
 	return m, nil
 }
@@ -103,26 +188,44 @@ var (
 
 // View renders the dashboard full-screen.
 func (m Model) View() tea.View {
-	var b strings.Builder
-
-	b.WriteString(titleStyle.Render("Shevet"))
-	b.WriteString("\n\n")
-
+	var body string
 	switch {
 	case !m.loaded:
-		b.WriteString(statusStyle.Render("Connecting to Server..."))
+		body = statusStyle.Render("Connecting to Server...")
 	case m.err != nil:
-		b.WriteString(errorStyle.Render("Cannot reach Server: " + m.err.Error()))
+		body = errorStyle.Render("Cannot reach Server: " + m.err.Error())
+	case m.view != nil && m.view.Exited:
+		body = statusStyle.Render(fmt.Sprintf("Pane %s exited", m.watching.ID))
+	case m.view != nil && sized(m.view.Grid):
+		// The live Pane, full-screen and read-only. Content larger than
+		// the terminal is clipped by the renderer; resize-on-focus is the
+		// dashboard slice's business.
+		view := tea.NewView(renderPane(m.view.Grid, m.view.Cursor))
+		view.AltScreen = true
+		return view
+	case m.watching != nil:
+		body = statusStyle.Render("Attaching to Pane " + m.watching.ID + "...")
 	default:
-		b.WriteString(renderHerdSummary(m.panes))
+		body = renderHerdSummary(m.panes)
 	}
 
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("Shevet"))
+	b.WriteString("\n\n")
+	b.WriteString(body)
 	b.WriteString("\n\n")
 	b.WriteString(helpStyle.Render("q quit"))
 
 	view := tea.NewView(b.String())
 	view.AltScreen = true
 	return view
+}
+
+// sized reports whether the stream's initial resize has arrived and the
+// grid is renderable.
+func sized(g *grid.Grid) bool {
+	w, _ := g.Size()
+	return w > 0
 }
 
 // renderHerdSummary renders the Herd as a count plus one line per Pane.

@@ -40,30 +40,36 @@ type Harness struct {
 	dir string
 }
 
-// Start boots the full harness and registers teardown with the test.
+// Start boots the full harness and registers teardown with the test. The
+// Server is attached to the sandbox tmux session, so every window started
+// there (StartAgent) becomes a Pane in the Herd.
 func Start(t *testing.T) *Harness {
 	t.Helper()
 
 	tm := tmuxtest.Start(t)
 	dir := testutil.ShortDir(t)
+	opts := server.Options{
+		SocketPath: filepath.Join(dir, "s.sock"),
+		Tmux:       &server.TmuxOptions{Socket: tm.Socket(), Session: "holder"},
+	}
 	return &Harness{
 		Tmux:   tm,
-		Client: StartServer(t, filepath.Join(dir, "s.sock")),
+		Client: StartServer(t, opts),
 		dir:    dir,
 	}
 }
 
-// StartServer boots an in-process Server on socketPath and returns a
-// connected client; teardown (client close, graceful Server shutdown with a
-// clean-exit assertion) registers with the test.
+// StartServer boots an in-process Server and returns a connected client;
+// teardown (client close, graceful Server shutdown with a clean-exit
+// assertion) registers with the test.
 //
 // In-process is deliberate: Listen is synchronous — readiness by
 // construction, no polling — and the race detector sees the Server. The
 // process boundary itself is covered by the e2e smoke tests.
-func StartServer(t *testing.T, socketPath string) *client.Client {
+func StartServer(t *testing.T, opts server.Options) *client.Client {
 	t.Helper()
 
-	srv := server.New(server.Options{SocketPath: socketPath}, slog.New(slog.DiscardHandler))
+	srv := server.New(opts, slog.New(slog.DiscardHandler))
 	if err := srv.Listen(); err != nil {
 		t.Fatalf("server Listen: %v", err)
 	}
@@ -83,7 +89,7 @@ func StartServer(t *testing.T, socketPath string) *client.Client {
 		}
 	})
 
-	c, err := client.Dial(socketPath)
+	c, err := client.Dial(opts.SocketPath)
 	if err != nil {
 		t.Fatalf("client Dial: %v", err)
 	}

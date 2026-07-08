@@ -19,6 +19,13 @@ option go_package = "github.com/irodion/shevet/proto/shevet/v1;shevetv1";
 service HerdService {
   // ListPanes returns every Pane currently in the Herd.
   rpc ListPanes(ListPanesRequest) returns (ListPanesResponse);
+
+  // WatchPane is the Matrix Render stream for one Pane: cell damage,
+  // cursor movement, and resizes, until the Pane exits or the Client
+  // hangs up. The first updates always establish the full current state
+  // (a resize followed by damage covering every non-default cell); after
+  // that, damage carries only cells that changed — never full frames.
+  rpc WatchPane(WatchPaneRequest) returns (stream PaneUpdate);
 }
 
 message ListPanesRequest {}
@@ -37,3 +44,70 @@ message Pane {
   // title is a human-readable label for dashboards.
   string title = 2;
 }
+
+message WatchPaneRequest {
+  // pane_id identifies the Pane to watch, as returned by ListPanes.
+  string pane_id = 1;
+}
+
+// PaneUpdate is one event on a Pane's render stream.
+message PaneUpdate {
+  oneof update {
+    CellDamage damage = 1;
+    PaneResized resized = 2;
+    PaneExited exited = 3;
+  }
+}
+
+// CellDamage is a coalesced batch of cell updates plus the cursor state at
+// flush time. Damage is idempotent: applying a batch twice yields the same
+// grid.
+message CellDamage {
+  repeated CellPatch cells = 1;
+
+  // cursor is the cursor state after this batch. Always present.
+  Cursor cursor = 2;
+}
+
+// CellPatch sets one cell of the grid. Field semantics mirror the internal
+// grid vocabulary: an absent/empty content is a blank cell, and zero colors
+// mean the terminal default.
+message CellPatch {
+  uint32 x = 1;
+  uint32 y = 2;
+
+  // content is the cell's grapheme cluster; empty means blank.
+  string content = 3;
+
+  // width is the number of columns the grapheme spans (0 for blank and
+  // spacer cells, 2 for CJK/emoji).
+  uint32 width = 4;
+
+  // fg and bg encode colors as 0 for the terminal default, otherwise
+  // (1<<24)|RGB.
+  uint32 fg = 5;
+  uint32 bg = 6;
+
+  // attrs is the text-attribute bitmask (bold, faint, italic, underline,
+  // blink, reverse, strikethrough — bits 0..6).
+  uint32 attrs = 7;
+}
+
+message Cursor {
+  uint32 x = 1;
+  uint32 y = 2;
+  bool hidden = 3;
+}
+
+// PaneResized reports the Pane's grid size. It is always the first update
+// on a WatchPane stream and recurs whenever tmux resizes the pane; the
+// Client's grid resets to default cells on every resize, followed by damage
+// re-establishing content.
+message PaneResized {
+  uint32 width = 1;
+  uint32 height = 2;
+}
+
+// PaneExited reports that the Pane left the Herd (its process ended or the
+// window closed). It is the stream's final update.
+message PaneExited {}

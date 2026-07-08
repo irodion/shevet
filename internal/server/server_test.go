@@ -8,9 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/irodion/shevet/internal/client"
 	"github.com/irodion/shevet/internal/harness"
 	"github.com/irodion/shevet/internal/server"
 	"github.com/irodion/shevet/internal/testutil"
+	"github.com/irodion/shevet/internal/tmuxtest"
 )
 
 // The boot-and-connect choreography lives in harness.StartServer, shared
@@ -21,8 +23,61 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.DiscardHandler)
 }
 
+// TestServe_SeedsPreexistingPaneContent covers attaching to a tmux session
+// whose panes already have content: the Server must reconstruct the visible
+// screen (the capture-pane seed) rather than starting from a blank grid.
+func TestServe_SeedsPreexistingPaneContent(t *testing.T) {
+	t.Parallel()
+	tm := tmuxtest.Start(t)
+
+	pane := tm.NewWindow(t, "existing", "printf '\\033[32mgreen\\033[0m seeded'; sleep 86400")
+	tm.WaitForContent(t, pane, "seeded")
+
+	c := harness.StartServer(t, server.Options{
+		SocketPath: testutil.SocketPath(t),
+		Tmux:       &server.TmuxOptions{Socket: tm.Socket(), Session: "holder"},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitTimeout)
+	defer cancel()
+	watch, err := c.WatchPane(ctx, pane)
+	if err != nil {
+		t.Fatalf("WatchPane: %v", err)
+	}
+
+	v := client.NewPaneView()
+	for v.Grid.RowText(0) != "green seeded" {
+		u, err := watch.Recv()
+		if err != nil {
+			t.Fatalf("Recv: %v (row so far %q)", err, v.Grid.RowText(0))
+		}
+		v.Apply(u)
+	}
+
+	// Styling survives the seed: capture-pane -e carries the SGR codes.
+	if cell := v.Grid.At(0, 0); cell.FG == 0 {
+		t.Errorf("seeded cell = %+v, want a green foreground", cell)
+	}
+}
+
+func TestServe_FailsFastOnMissingTmuxSession(t *testing.T) {
+	t.Parallel()
+	tm := tmuxtest.Start(t)
+
+	srv := server.New(server.Options{
+		SocketPath: testutil.SocketPath(t),
+		Tmux:       &server.TmuxOptions{Socket: tm.Socket(), Session: "no-such-session"},
+	}, discardLogger())
+	if err := srv.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	if err := srv.Serve(context.Background()); err == nil {
+		t.Fatal("Serve with a missing tmux session succeeded, want error")
+	}
+}
+
 func TestServe_ServesEmptyHerd(t *testing.T) {
-	c := harness.StartServer(t, testutil.SocketPath(t))
+	c := harness.StartServer(t, server.Options{SocketPath: testutil.SocketPath(t)})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -65,7 +120,7 @@ func TestServe_ShutsDownCleanlyAndRemovesSocket(t *testing.T) {
 
 func TestListen_RefusesSecondServerOnSameSocket(t *testing.T) {
 	socketPath := testutil.SocketPath(t)
-	harness.StartServer(t, socketPath)
+	harness.StartServer(t, server.Options{SocketPath: socketPath})
 
 	second := server.New(server.Options{SocketPath: socketPath}, discardLogger())
 	if err := second.Listen(); err == nil {
@@ -89,7 +144,7 @@ func TestListen_ClearsStaleSocket(t *testing.T) {
 		t.Fatalf("stale socket file was not left behind: %v", err)
 	}
 
-	c := harness.StartServer(t, socketPath)
+	c := harness.StartServer(t, server.Options{SocketPath: socketPath})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -123,7 +178,7 @@ func TestListen_RefusesToReplaceNonSocketFile(t *testing.T) {
 
 func TestListen_RestrictsSocketPermissions(t *testing.T) {
 	socketPath := testutil.SocketPath(t)
-	harness.StartServer(t, socketPath)
+	harness.StartServer(t, server.Options{SocketPath: socketPath})
 
 	info, err := os.Lstat(socketPath)
 	if err != nil {

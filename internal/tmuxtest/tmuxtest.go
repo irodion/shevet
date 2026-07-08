@@ -60,6 +60,12 @@ func Start(t *testing.T) *Tmux {
 	return tm
 }
 
+// Socket returns the sandbox tmux server's socket path, for components that
+// dial tmux themselves (e.g. a control-mode attachment).
+func (tm *Tmux) Socket() string {
+	return tm.socket
+}
+
 // Cmd returns an exec.Cmd for a tmux subcommand against the sandbox socket.
 func (tm *Tmux) Cmd(args ...string) *exec.Cmd {
 	cmd := exec.Command("tmux", append([]string{"-S", tm.socket}, args...)...)
