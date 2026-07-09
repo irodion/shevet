@@ -73,6 +73,28 @@ func TestParseConfigDefaults(t *testing.T) {
 	}
 }
 
+func TestParseConfigProxy(t *testing.T) {
+	// ProxyJump/ProxyCommand are captured so Dial can reject them; the "none"
+	// sentinel that disables a proxy reads back as unset.
+	jump, err := parseConfig("via", []byte("proxyjump bastion.example.com\n"))
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if jump.ProxyJump != "bastion.example.com" {
+		t.Errorf("ProxyJump = %q, want bastion.example.com", jump.ProxyJump)
+	}
+
+	cmd, _ := parseConfig("via", []byte("proxycommand /usr/bin/nc %h %p\n"))
+	if cmd.ProxyCommand != "/usr/bin/nc %h %p" {
+		t.Errorf("ProxyCommand = %q, want the nc command", cmd.ProxyCommand)
+	}
+
+	none, _ := parseConfig("via", []byte("proxycommand none\nproxyjump none\n"))
+	if none.ProxyCommand != "" || none.ProxyJump != "" {
+		t.Errorf("proxy=none should read as unset, got ProxyCommand=%q ProxyJump=%q", none.ProxyCommand, none.ProxyJump)
+	}
+}
+
 func TestConfigStrict(t *testing.T) {
 	// Only explicit no/off opts out; everything else stays strict so an
 	// unknown host key is an error, not a shrug (issue #10).

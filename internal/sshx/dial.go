@@ -35,6 +35,12 @@ var (
 	// ErrHostKey means the Host's key was unknown or did not match the
 	// pinned entry in known_hosts. Never downgraded to a warning.
 	ErrHostKey = errors.New("ssh host key verification failed")
+
+	// ErrUnsupportedProxy means the Host's ssh_config routes the connection
+	// through a bastion (ProxyJump) or an external command (ProxyCommand),
+	// which this transport does not yet implement. Reported up front rather
+	// than dialing HostName:Port directly and failing obscurely before auth.
+	ErrUnsupportedProxy = errors.New("ssh proxy configuration is not supported")
 )
 
 // handshakeTimeout bounds the TCP dial and SSH handshake so a black-holed
@@ -54,6 +60,10 @@ type Conn struct {
 // (wrapped) for the two failures a user can act on; other failures (network,
 // protocol) are returned as-is.
 func Dial(ctx context.Context, cfg *Config) (*Conn, error) {
+	if err := cfg.checkDirectlyReachable(); err != nil {
+		return nil, err
+	}
+
 	methods, closeAuth := authMethods(cfg)
 	defer closeAuth()
 

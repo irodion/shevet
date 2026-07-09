@@ -53,6 +53,14 @@ type Config struct {
 	// "accept-new", "ask" (all treated as strict here), or "no"/"off" to
 	// disable verification entirely.
 	StrictHostKeyChecking string
+
+	// ProxyJump and ProxyCommand, when set, mean the Host is reached through a
+	// bastion or an external command rather than a direct TCP dial. This
+	// transport dials HostName:Port directly (Dial rejects a proxied Host with
+	// ErrUnsupportedProxy), so they are captured only to fail loudly instead
+	// of silently ignoring them.
+	ProxyJump    string
+	ProxyCommand string
 }
 
 // strict reports whether an unknown or changed host key must be a hard error.
@@ -66,6 +74,21 @@ func (c *Config) strict() bool {
 		return false
 	default:
 		return true
+	}
+}
+
+// checkDirectlyReachable returns ErrUnsupportedProxy when the Host's config
+// routes the connection through a proxy this transport cannot honor, so the
+// failure is a clear message instead of a direct dial to HostName:Port that
+// hangs or is refused before auth.
+func (c *Config) checkDirectlyReachable() error {
+	switch {
+	case c.ProxyJump != "":
+		return fmt.Errorf("%w: ProxyJump %q for %q — reach this Host directly, or open the jump manually", ErrUnsupportedProxy, c.ProxyJump, c.Host)
+	case c.ProxyCommand != "":
+		return fmt.Errorf("%w: ProxyCommand set for %q — reach this Host directly", ErrUnsupportedProxy, c.Host)
+	default:
+		return nil
 	}
 }
 
@@ -133,6 +156,10 @@ func parseConfig(host string, out []byte) (*Config, error) {
 			}
 		case "stricthostkeychecking":
 			cfg.StrictHostKeyChecking = val
+		case "proxyjump":
+			cfg.ProxyJump = noneToEmpty(val)
+		case "proxycommand":
+			cfg.ProxyCommand = noneToEmpty(val)
 		}
 	}
 	if err := scan.Err(); err != nil {
@@ -151,6 +178,15 @@ func parseConfig(host string, out []byte) (*Config, error) {
 // addr is the "host:port" endpoint to dial.
 func (c *Config) addr() string {
 	return c.HostName + ":" + c.Port
+}
+
+// noneToEmpty maps ssh's sentinel "none" (which explicitly disables an option)
+// to the empty string, so a disabled ProxyJump/ProxyCommand reads as "unset".
+func noneToEmpty(val string) string {
+	if val == "none" {
+		return ""
+	}
+	return val
 }
 
 // expandTilde rewrites a leading ~ or ~/ to the current user's home. ssh -G
