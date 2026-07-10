@@ -56,6 +56,14 @@ type subscriber struct {
 // burst fits without a spurious pause, small enough to bound per-pane memory.
 const opsQueue = 64
 
+// maxRetainedBatch bounds the coalescing buffer a pane keeps once its output
+// subsides. A wakeup that coalesces more than this keeps reusing its buffer, so
+// steady bulk output (which can exceed it — one tmux %output decodes to well
+// over 64 KiB) never re-allocates; once a later, smaller wakeup no longer needs
+// the grown capacity, the buffer is released rather than pinned at the flood's
+// high-water mark for the pane's lifetime (ADR-0008).
+const maxRetainedBatch = 64 * 1024
+
 // pipeline is the per-Pane render pipeline: it owns the Pane's emulator
 // (one goroutine end-to-end, ADR-0006), coalesces damage on the 16ms
 // window, and fans flushes out to subscribers.
@@ -242,7 +250,17 @@ func (p *pipeline) run(w, h int, newEmu func(w, h int) emu.Emulator) {
 			return
 		}
 		term.Write(outBatch) //nolint:errcheck // the emulator consumes everything
-		outBatch = outBatch[:0]
+		// Keep reusing the buffer while wakeups still fill it — a busy or
+		// bulk-streaming pane never re-allocates. Release it only once an
+		// oversized buffer outgrows what a wakeup needs (the flood that grew it
+		// has passed), so a pane that falls quiet doesn't pin the flood's peak
+		// for its lifetime (ADR-0008). This is subscriber-independent, so an
+		// unwatched pane is bounded too.
+		if cap(outBatch) > maxRetainedBatch && len(outBatch) <= maxRetainedBatch {
+			outBatch = nil
+		} else {
+			outBatch = outBatch[:0]
+		}
 		dirty = true
 		arm()
 	}
@@ -258,19 +276,19 @@ func (p *pipeline) run(w, h int, newEmu func(w, h int) emu.Emulator) {
 			continue
 		}
 
-		// Gather every op already queued for this wakeup in arrival order,
-		// then apply it with consecutive output coalesced. Draining the
-		// channel this way also keeps it short, so output()'s full-queue
-		// check tracks the emulator falling behind rather than scheduling.
+		// Gather the ops already queued at this wakeup — a snapshot of the
+		// channel, not a drain-until-empty. Each receive frees a slot the
+		// watcher can immediately refill, so a continuous producer could keep a
+		// drain-until-empty loop receiving without bound: burst and outBatch
+		// would grow past the queue size, term.Write would be deferred, and
+		// output()'s full-queue pause would never trip (ADR-0008). Snapshotting
+		// bounds the batch to at most opsQueue, so every wakeup makes progress
+		// and coalesces; ops that arrive during the batch wait for the next one,
+		// which keeps the channel short so its full-queue check tracks the
+		// emulator falling behind, not scheduling.
 		burst = append(burst[:0], op)
-	gather:
-		for {
-			select {
-			case more := <-p.ops:
-				burst = append(burst, more)
-			default:
-				break gather
-			}
+		for queued := len(p.ops); queued > 0; queued-- {
+			burst = append(burst, <-p.ops)
 		}
 
 		for _, op := range burst {
@@ -328,5 +346,9 @@ func (p *pipeline) run(w, h int, newEmu func(w, h int) emu.Emulator) {
 		// Flush output that trailed the last control op (or the whole burst
 		// when it was output-only).
 		writeBatch()
+		// Release the burst's payload references before blocking for the next
+		// wakeup: burst[:0] on the next gather would otherwise leave the tail
+		// of a large flood pinning its opOutput payloads until overwritten.
+		clear(burst)
 	}
 }

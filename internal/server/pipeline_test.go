@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -84,6 +85,30 @@ func TestPipeline_SubscriberGetsSyncThenIncrements(t *testing.T) {
 			t.Errorf("incremental update carries %d cells, want only the changed few", len(u.damage))
 		}
 	}
+}
+
+// TestPipeline_ReleasesFloodBufferButKeepsRendering grows the coalescing buffer
+// past maxRetainedBatch with a flood wakeup, then a later smaller wakeup that no
+// longer needs the grown capacity takes the release branch — and the render must
+// still compose correctly, proving the buffer resets from released cleanly.
+func TestPipeline_ReleasesFloodBufferButKeepsRendering(t *testing.T) {
+	t.Parallel()
+	p := startPipeline(t, 40, 4)
+	v := view(t, p.subscribe())
+
+	// A batch larger than maxRetainedBatch grows the buffer's capacity. It ends
+	// by clearing the screen and homing, so the visible result is a known marker
+	// regardless of the volume that preceded it.
+	big := bytes.Repeat([]byte("x"), maxRetainedBatch+1024)
+	big = append(big, "\x1b[2J\x1b[Hfirst"...)
+	p.output(big)
+	v.waitFor(func(g *grid.Grid) bool { return g.RowText(0) == "first" })
+
+	// A small later wakeup no longer fills the grown buffer, so writeBatch
+	// releases it — and this write must still render, proving the reset buffer
+	// composes with new output rather than dropping or corrupting it.
+	p.output([]byte(" second"))
+	v.waitFor(func(g *grid.Grid) bool { return g.RowText(0) == "first second" })
 }
 
 // TestPipeline_FirstUpdateIsAlwaysTheResize pins the stream contract: a
