@@ -69,11 +69,30 @@ func runConnect(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	}
 	defer c.Close() //nolint:errcheck // read-only connection teardown
 
-	if err := tui.Run(ctx, c); err != nil {
+	// The Client keys every Pane by PaneRef (Host alias + pane id); this slice
+	// dials one Host, so its alias scopes the whole Herd. Multi-Host dialing
+	// arrives with the dashboard (#11); NewServers already enforces the alias
+	// uniqueness that identity depends on.
+	servers, err := tui.NewServers([]tui.Server{{Alias: hostAlias(host), Conn: tui.FromClient(c)}})
+	if err != nil {
+		fmt.Fprintf(stderr, "shevet connect: %v\n", err)
+		return exitError
+	}
+
+	if err := tui.Run(ctx, servers); err != nil {
 		fmt.Fprintf(stderr, "shevet connect: %v\n", err)
 		return exitError
 	}
 	return exitOK
+}
+
+// hostAlias names the connection for PaneRef scoping: the SSH <host> as
+// written, or "local" for a --socket target (which has no host name).
+func hostAlias(host string) string {
+	if host == "" {
+		return "local"
+	}
+	return host
 }
 
 // dialTarget picks the transport from the parsed target: a remote Host over

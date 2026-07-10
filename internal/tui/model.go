@@ -2,8 +2,14 @@
 // `shevet connect` (docs/adr/0002-pure-go-tui-bubbletea-v2.md).
 //
 // In this slice the dashboard shows one live Pane: it watches the first Pane
-// in the Herd full-screen, read-only. The Pane grid widget with navigation
-// arrives with the dashboard slice.
+// in the aggregated Herd full-screen, read-only. The Pane grid widget with
+// navigation arrives with the dashboard slice (#11).
+//
+// The Herd is aggregated across one or more Server connections, each carrying
+// a Host alias. Every Pane is keyed by a herd.PaneRef (alias + Server-scoped
+// pane id), so panes that share a tmux id across Hosts never collide; input
+// and watches route to the owning connection by the PaneRef's Host, while the
+// wire still carries the bare pane id (ARCHITECTURE §3.2).
 package tui
 
 import (
@@ -60,21 +66,70 @@ func (cc clientConn) SendInput(ctx context.Context) (InputSink, error) {
 	return cc.c.SendInput(ctx) //nolint:wrapcheck // pure adapter
 }
 
+// FromClient adapts a dialed *client.Client into a Conn for the dashboard.
+func FromClient(c *client.Client) Conn { return clientConn{c: c} }
+
+// Server is one Host connection in the Client's multi-Host view: a Host alias
+// paired with the connection reaching its Server. The alias scopes every Pane
+// the connection yields into a herd.PaneRef.
+type Server struct {
+	Alias string
+	Conn  Conn
+}
+
+// NewServers validates the connection set for one Client invocation: aliases
+// must be non-empty and unique, because the Client keys every Pane by PaneRef
+// (Host alias + pane id) — a repeated alias would collapse two Hosts' Panes
+// into one identity. It returns the servers unchanged on success, or an
+// actionable error naming the offending alias.
+func NewServers(servers []Server) ([]Server, error) {
+	seen := make(map[string]struct{}, len(servers))
+	for _, s := range servers {
+		if s.Alias == "" {
+			return nil, fmt.Errorf("host alias must not be empty")
+		}
+		if _, dup := seen[s.Alias]; dup {
+			return nil, fmt.Errorf("duplicate host alias %q: each Host in one connect invocation needs a distinct alias", s.Alias)
+		}
+		seen[s.Alias] = struct{}{}
+	}
+	return servers, nil
+}
+
+// refPane is a Pane scoped by the Host alias it was fetched from — the Herd is
+// aggregated across connections, so a Pane must carry the alias that resolves
+// it back to the connection that owns it. The Client-scoped PaneRef is derived
+// from the two on demand, so the pane id is stored once (on Pane).
+type refPane struct {
+	Host string
+	Pane herd.Pane
+}
+
+// Ref is the Pane's Client-scoped identity: its Host alias plus its
+// Server-scoped id.
+func (p refPane) Ref() herd.PaneRef {
+	return herd.PaneRef{Host: p.Host, ID: p.Pane.ID}
+}
+
 // Model is the dashboard's Bubble Tea model. Construct with New.
 type Model struct {
-	conn Conn
+	// servers is the aggregated Herd's source, in display order; conns
+	// resolves a PaneRef's Host alias back to the connection that owns it,
+	// for watch and input routing.
+	servers []Server
+	conns   map[string]Conn
 
-	// ctx bounds the connection's streams; commands dial with it so
+	// ctx bounds the connections' streams; commands dial with it so
 	// quitting the program tears the watch down.
 	ctx context.Context
 
-	panes  []herd.Pane
+	panes  []refPane
 	loaded bool
 	err    error
 
 	// The watched Pane, once one is picked from the Herd; view folds the
 	// render stream into the local grid.
-	watching *herd.Pane
+	watching *refPane
 	stream   PaneStream
 	view     *client.PaneView
 
@@ -91,21 +146,27 @@ type Model struct {
 	inputErr error
 }
 
-// New returns a dashboard Model that will populate itself from conn.
-func New(ctx context.Context, conn Conn) Model {
-	return Model{conn: conn, ctx: ctx}
+// New returns a dashboard Model that will populate itself from the given
+// Server connections. Aliases are assumed validated (see NewServers).
+func New(ctx context.Context, servers []Server) Model {
+	conns := make(map[string]Conn, len(servers))
+	for _, s := range servers {
+		conns[s.Alias] = s.Conn
+	}
+	return Model{servers: servers, conns: conns, ctx: ctx}
 }
 
-// Run drives the dashboard to completion on the caller's terminal.
-func Run(ctx context.Context, c *client.Client) error {
-	program := tea.NewProgram(New(ctx, clientConn{c: c}), tea.WithContext(ctx))
+// Run drives the dashboard to completion on the caller's terminal, over the
+// validated Server connections.
+func Run(ctx context.Context, servers []Server) error {
+	program := tea.NewProgram(New(ctx, servers), tea.WithContext(ctx))
 	if _, err := program.Run(); err != nil {
 		return fmt.Errorf("run dashboard: %w", err)
 	}
 	return nil
 }
 
-type panesLoadedMsg []herd.Pane
+type panesLoadedMsg []refPane
 
 type loadFailedMsg struct{ err error }
 
@@ -121,28 +182,40 @@ type inputFailedMsg struct{ err error }
 
 // Init kicks off the initial Herd fetch.
 func (m Model) Init() tea.Cmd {
-	return fetchPanesCmd(m.ctx, m.conn)
+	return fetchPanesCmd(m.ctx, m.servers)
 }
 
 // fetchPanesCmd closes over only what it needs, not the whole Model —
 // commands outlive the Model value that issued them, and should not carry it.
-func fetchPanesCmd(ctx context.Context, conn Conn) tea.Cmd {
+// It lists each Server's Panes and tags them with the Host alias, aggregating
+// the Herd across connections; a Host's pane ids stay Server-scoped on the
+// wire but become PaneRefs Client-side. Any Host's failure fails the load,
+// with the alias named so the cause is unambiguous.
+func fetchPanesCmd(ctx context.Context, servers []Server) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(ctx, fetchTimeout)
 		defer cancel()
 
-		panes, err := conn.ListPanes(ctx)
-		if err != nil {
-			return loadFailedMsg{err: err}
+		var all []refPane
+		for _, s := range servers {
+			panes, err := s.Conn.ListPanes(ctx)
+			if err != nil {
+				return loadFailedMsg{err: fmt.Errorf("host %s: %w", s.Alias, err)}
+			}
+			for _, p := range panes {
+				all = append(all, refPane{Host: s.Alias, Pane: p})
+			}
 		}
-		return panesLoadedMsg(panes)
+		return panesLoadedMsg(all)
 	}
 }
 
-// watchPaneCmd opens the render stream for the chosen Pane.
-func watchPaneCmd(ctx context.Context, conn Conn, paneID string) tea.Cmd {
+// watchPaneCmd opens the render stream for the chosen Pane on its owning
+// connection; the wire carries the bare Server-scoped id (ref.ID), while the
+// Model tracks the full PaneRef.
+func watchPaneCmd(ctx context.Context, conn Conn, ref herd.PaneRef) tea.Cmd {
 	return func() tea.Msg {
-		stream, err := conn.WatchPane(ctx, paneID)
+		stream, err := conn.WatchPane(ctx, ref.ID)
 		if err != nil {
 			return watchFailedMsg{err: err}
 		}
@@ -173,7 +246,7 @@ const forwardBuffer = 256
 // stream (not safe for concurrent use) has a single owner, and the UI
 // goroutine never blocks on the socket. It returns inputFailedMsg if the
 // stream cannot open or a send fails, and nothing when the program ends.
-func forwardInputCmd(ctx context.Context, conn Conn, paneID string, ch <-chan []byte) tea.Cmd {
+func forwardInputCmd(ctx context.Context, conn Conn, ref herd.PaneRef, ch <-chan []byte) tea.Cmd {
 	return func() tea.Msg {
 		sink, err := conn.SendInput(ctx)
 		if err != nil {
@@ -184,7 +257,9 @@ func forwardInputCmd(ctx context.Context, conn Conn, paneID string, ch <-chan []
 			case <-ctx.Done():
 				return nil
 			case data := <-ch:
-				if err := sink.SendKeys(paneID, data); err != nil {
+				// The PaneRef routed us to this Host's connection; the wire
+				// carries the bare Server-scoped id.
+				if err := sink.SendKeys(ref.ID, data); err != nil {
 					return inputFailedMsg{err: err}
 				}
 			}
@@ -212,12 +287,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.panes = msg
 		m.loaded = true
 		m.err = nil
-		// This slice views one Pane: the Herd's first. The grid dashboard
-		// slice replaces this with navigation.
+		// This slice views one Pane: the aggregated Herd's first. The grid
+		// dashboard slice (#11) replaces this with PaneRef-keyed navigation.
 		if len(m.panes) > 0 {
 			pane := m.panes[0]
 			m.watching = &pane
-			return m, watchPaneCmd(m.ctx, m.conn, pane.ID)
+			return m, watchPaneCmd(m.ctx, m.conns[pane.Host], pane.Ref())
 		}
 
 	case loadFailedMsg:
@@ -279,7 +354,8 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if m.input == nil {
 			m.inputErr = nil
 			m.input = make(chan []byte, forwardBuffer)
-			return m, forwardInputCmd(m.ctx, m.conn, m.watching.ID, m.input)
+			ref := m.watching.Ref()
+			return m, forwardInputCmd(m.ctx, m.conns[ref.Host], ref, m.input)
 		}
 	}
 	return m, nil
@@ -314,7 +390,7 @@ func (m Model) View() tea.View {
 	case m.err != nil:
 		body = errorStyle.Render("Cannot reach Server: " + m.err.Error())
 	case m.view != nil && m.view.Exited:
-		body = statusStyle.Render(fmt.Sprintf("Pane %s exited", m.watching.ID))
+		body = statusStyle.Render(fmt.Sprintf("Pane %s exited", m.watching.Ref()))
 	case m.view != nil && sized(m.view.Grid):
 		// The live Pane, full-screen and read-only. Content larger than
 		// the terminal is clipped by the renderer; resize-on-focus is the
@@ -323,7 +399,7 @@ func (m Model) View() tea.View {
 		view.AltScreen = true
 		return view
 	case m.watching != nil:
-		body = statusStyle.Render("Attaching to Pane " + m.watching.ID + "...")
+		body = statusStyle.Render("Attaching to Pane " + m.watching.Ref().String() + "...")
 	default:
 		body = renderHerdSummary(m.panes)
 	}
@@ -347,8 +423,9 @@ func sized(g *grid.Grid) bool {
 	return w > 0
 }
 
-// renderHerdSummary renders the Herd as a count plus one line per Pane.
-func renderHerdSummary(panes []herd.Pane) string {
+// renderHerdSummary renders the aggregated Herd as a count plus one line per
+// Pane, each named by its PaneRef so panes from different Hosts stay distinct.
+func renderHerdSummary(panes []refPane) string {
 	var b strings.Builder
 
 	noun := "Panes"
@@ -358,7 +435,7 @@ func renderHerdSummary(panes []herd.Pane) string {
 	fmt.Fprintf(&b, "%d %s", len(panes), noun)
 
 	for _, p := range panes {
-		fmt.Fprintf(&b, "\n  %s  %s", p.ID, p.Title)
+		fmt.Fprintf(&b, "\n  %s  %s", p.Ref(), p.Pane.Title)
 	}
 	return b.String()
 }

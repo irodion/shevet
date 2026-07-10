@@ -93,6 +93,15 @@ func (s *fakeSink) received() []byte {
 	return append([]byte(nil), s.keys...)
 }
 
+// testAlias is the Host alias every single-connection test scopes its Panes
+// under; PaneRefs in those tests are testAlias:<pane id>.
+const testAlias = "h"
+
+// single wraps one connection as the sole Server in a Client invocation.
+func single(conn Conn) []Server {
+	return []Server{{Alias: testAlias, Conn: conn}}
+}
+
 // pump runs one command and folds its message into the model, the way the
 // Bubble Tea runtime would, returning the next command.
 func pump(t *testing.T, m Model, cmd tea.Cmd) (Model, tea.Cmd) {
@@ -111,7 +120,7 @@ func pump(t *testing.T, m Model, cmd tea.Cmd) (Model, tea.Cmd) {
 // loadedModel runs the fetch cycle (Init cmd -> resulting msg -> Update).
 func loadedModel(t *testing.T, conn Conn) (Model, tea.Cmd) {
 	t.Helper()
-	m := New(context.Background(), conn)
+	m := New(context.Background(), single(conn))
 	return pump(t, m, m.Init())
 }
 
@@ -134,14 +143,14 @@ func TestView_FetchError(t *testing.T) {
 }
 
 func TestView_BeforeLoad(t *testing.T) {
-	m := New(context.Background(), &fakeConn{})
+	m := New(context.Background(), single(&fakeConn{}))
 	if got := viewContent(m); !strings.Contains(got, "Connecting") {
 		t.Errorf("view does not show the connecting state:\n%s", got)
 	}
 }
 
 func TestView_UsesAltScreen(t *testing.T) {
-	if !New(context.Background(), &fakeConn{}).View().AltScreen {
+	if !New(context.Background(), single(&fakeConn{})).View().AltScreen {
 		t.Error("dashboard does not request the alternate screen")
 	}
 }
@@ -151,7 +160,7 @@ func TestUpdate_QuitKeys(t *testing.T) {
 		{Code: 'q', Text: "q"},
 		{Code: 'c', Mod: tea.ModCtrl},
 	} {
-		_, cmd := New(context.Background(), &fakeConn{}).Update(key)
+		_, cmd := New(context.Background(), single(&fakeConn{})).Update(key)
 		if cmd == nil {
 			t.Errorf("key %q did not produce a command", tea.Key(key).String())
 			continue
@@ -434,5 +443,79 @@ func TestFocus_IgnoredWithoutALivePane(t *testing.T) {
 	}
 	if cmd != nil {
 		t.Errorf("opened an input stream with no Pane, cmd=%T", cmd())
+	}
+}
+
+func TestNewServers_RejectsDuplicateAliases(t *testing.T) {
+	_, err := NewServers([]Server{
+		{Alias: "prod", Conn: &fakeConn{}},
+		{Alias: "prod", Conn: &fakeConn{}},
+	})
+	if err == nil {
+		t.Fatal("duplicate alias accepted, want an error")
+	}
+	// The message must name the offending alias so the developer can fix the
+	// invocation, not just "invalid".
+	if !strings.Contains(err.Error(), "prod") {
+		t.Errorf("error %q does not name the duplicate alias", err)
+	}
+}
+
+func TestNewServers_RejectsEmptyAlias(t *testing.T) {
+	if _, err := NewServers([]Server{{Alias: "", Conn: &fakeConn{}}}); err == nil {
+		t.Fatal("empty alias accepted, want an error")
+	}
+}
+
+// TestHerd_TwoServersShareIdsWithoutCollision is the multi-Host identity
+// contract: two Servers each owning a pane %0 aggregate into one Client model
+// as distinct PaneRefs, and watch/input route to the owning connection by the
+// PaneRef's Host — never leaking across to the other Server that shares the id.
+func TestHerd_TwoServersShareIdsWithoutCollision(t *testing.T) {
+	newConn := func(title string) *fakeConn {
+		return &fakeConn{
+			panes:  []herd.Pane{{ID: "%0", Title: title}},
+			stream: &fakeStream{updates: []client.PaneUpdate{{Resized: &grid.Size{W: 10, H: 3}}}},
+			sink:   &fakeSink{},
+		}
+	}
+	alpha, beta := newConn("on-alpha"), newConn("on-beta")
+
+	servers, err := NewServers([]Server{{Alias: "alpha", Conn: alpha}, {Alias: "beta", Conn: beta}})
+	if err != nil {
+		t.Fatalf("NewServers: %v", err)
+	}
+
+	m := New(context.Background(), servers)
+	m, cmd := pump(t, m, m.Init()) // fetch both Hosts -> aggregated Herd -> watch first
+
+	// Both %0 panes coexist under distinct PaneRefs.
+	if len(m.panes) != 2 {
+		t.Fatalf("aggregated %d panes, want 2 (one per Host)", len(m.panes))
+	}
+	if r0, r1 := m.panes[0].Ref(), m.panes[1].Ref(); r0 == r1 {
+		t.Fatalf("panes from different Hosts collided on identity: both %s", r0)
+	}
+	if got := m.panes[0].Ref().String(); got != "alpha:%0" {
+		t.Errorf("first PaneRef = %q, want alpha:%%0", got)
+	}
+
+	// The first pane is alpha's: its watch went to alpha, and beta was untouched.
+	m, cmd = pump(t, m, cmd) // watchStarted -> recv
+	m, _ = pump(t, m, cmd)   // resize update applied; now live and focusable
+	if len(alpha.watched) != 1 || alpha.watched[0] != "%0" {
+		t.Errorf("alpha watched = %v, want [%%0]", alpha.watched)
+	}
+	if len(beta.watched) != 0 {
+		t.Errorf("beta was watched (%v) though the selected pane is alpha's", beta.watched)
+	}
+
+	// Typing into alpha's pane reaches alpha's Server only, even though beta
+	// owns a pane with the same bare id.
+	m = enterFocus(t, m)
+	m, _ = press(t, m, tea.KeyPressMsg{Code: 'z', Text: "z"})
+	waitKeys(t, alpha.sink, "z")
+	if got := beta.sink.received(); len(got) != 0 {
+		t.Errorf("input leaked to beta's Server: %q", got)
 	}
 }
