@@ -3,16 +3,18 @@ package tui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/irodion/shevet/internal/client"
 	"github.com/irodion/shevet/internal/grid"
 	"github.com/irodion/shevet/internal/herd"
+	"github.com/irodion/shevet/internal/testutil"
 )
 
 // fakeStream is a scripted render stream. Once the script is drained, Recv
@@ -213,11 +215,21 @@ func runWatches(t *testing.T, m Model, cmd tea.Cmd) Model {
 }
 
 // update feeds one pane update straight into the model, as the receive loop
-// would deliver it.
+// would deliver it — tagged with the Pane's current stream, the way a real
+// recvCmd message is.
 func update(t *testing.T, m Model, paneID string, u client.PaneUpdate) Model {
 	t.Helper()
-	m, _ = feed(t, m, paneUpdateMsg{ref: testRef(paneID), update: u})
+	m, _ = feed(t, m, paneUpdateMsg{ref: testRef(paneID), stream: currentStream(m, testRef(paneID)), update: u})
 	return m
+}
+
+// currentStream is the stream the model believes feeds ref (nil when the
+// Pane is unknown), for building messages that must pass the staleness check.
+func currentStream(m Model, ref herd.PaneRef) PaneStream {
+	if st := m.views[ref]; st != nil {
+		return st.stream
+	}
+	return nil
 }
 
 // sizeMsg gives the dashboard its viewport, as the runtime does on start.
@@ -327,7 +339,7 @@ func TestGrid_RendersLiveThumbnails(t *testing.T) {
 	got := viewContent(m)
 	for _, want := range []string{"agent-a", "agent-b", "alpha says hi", "beta waits", "h:%1", "h:%2"} {
 		if !strings.Contains(got, want) {
-			t.Errorf("grid view is missing %q:\n%s", want, stripSGR(got))
+			t.Errorf("grid view is missing %q:\n%s", want, ansi.Strip(got))
 		}
 	}
 }
@@ -403,7 +415,7 @@ func enterFocus(t *testing.T, m Model) Model {
 	t.Helper()
 	next, cmd := press(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
 	m = next
-	if !m.focused {
+	if !m.focused() {
 		t.Fatal("pressing enter on a live Pane did not enter passthrough")
 	}
 	if cmd != nil {
@@ -414,36 +426,23 @@ func enterFocus(t *testing.T, m Model) Model {
 	return m
 }
 
-// waitFor polls until check passes, for sink-side assertions racing the
-// forwarding goroutine.
-func waitFor(t *testing.T, desc string, check func() bool) {
-	t.Helper()
-	deadline := time.After(2 * time.Second)
-	for {
-		if check() {
-			return
-		}
-		select {
-		case <-deadline:
-			t.Fatalf("timed out waiting for %s", desc)
-		case <-time.After(2 * time.Millisecond):
-		}
-	}
-}
-
-// waitKeys waits for the sink to have received exactly want.
+// waitKeys waits for the sink to have received exactly want (the sink is
+// fed from the forwarding Cmd's goroutine, so assertions must poll).
 func waitKeys(t *testing.T, sink *fakeSink, want string) {
 	t.Helper()
-	waitFor(t, "forwarded keys "+want, func() bool { return string(sink.received()) == want })
-	if got := string(sink.received()); got != want {
-		t.Fatalf("forwarded %q, want %q", got, want)
-	}
+	testutil.Eventually(t, fmt.Sprintf("forwarded keys %q", want), func() (bool, string) {
+		got := string(sink.received())
+		return got == want, fmt.Sprintf("forwarded %q", got)
+	})
 }
 
 // waitResizes waits for the sink to have received exactly the given resizes.
 func waitResizes(t *testing.T, sink *fakeSink, want ...resizeCall) {
 	t.Helper()
-	waitFor(t, "forwarded resizes", func() bool { return len(sink.resized()) >= len(want) })
+	testutil.Eventually(t, "forwarded resizes", func() (bool, string) {
+		got := sink.resized()
+		return len(got) >= len(want), fmt.Sprintf("resizes so far: %v", got)
+	})
 	got := sink.resized()
 	if len(got) != len(want) {
 		t.Fatalf("resizes = %v, want %v", got, want)
@@ -470,7 +469,7 @@ func TestFocus_ResizesPaneToViewportAndRestores(t *testing.T) {
 
 	// The leader returns to the grid and restores the pre-focus size.
 	m, _ = press(t, m, tea.KeyPressMsg{Code: '\\', Mod: tea.ModCtrl})
-	if m.focused {
+	if m.focused() {
 		t.Fatal("the leader did not return from passthrough")
 	}
 	waitResizes(t, conn.sink,
@@ -533,7 +532,7 @@ func TestFocus_LeaderReturnsToGridKeys(t *testing.T) {
 	m = enterFocus(t, m)
 
 	m, _ = press(t, m, tea.KeyPressMsg{Code: '\\', Mod: tea.ModCtrl}) // Ctrl-\
-	if m.focused {
+	if m.focused() {
 		t.Fatal("the leader did not return from passthrough")
 	}
 	// Back on the grid, 'q' quits again.
@@ -577,14 +576,14 @@ func TestFocus_UnavailableWhenInputStreamFails(t *testing.T) {
 	m, cmd := press(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
 	m, _ = feed(t, m, cmd()) // forwarding Cmd fails to open -> inputFailedMsg
 
-	if m.focused {
+	if m.focused() {
 		t.Error("stayed in passthrough despite the input stream failing")
 	}
-	if m.inputErr == nil {
+	if m.inputErrs[testAlias] == nil {
 		t.Error("input failure was not recorded")
 	}
 	if got := viewContent(m); !strings.Contains(got, "input unavailable") {
-		t.Errorf("grid does not surface the input failure:\n%s", stripSGR(got))
+		t.Errorf("grid does not surface the input failure:\n%s", ansi.Strip(got))
 	}
 	// 'q' quits again, since passthrough dropped back to the grid.
 	_, cmd = press(t, m, tea.KeyPressMsg{Code: 'q', Text: "q"})
@@ -602,8 +601,8 @@ func TestFocus_RetriesAfterInputFailure(t *testing.T) {
 	// First attempt fails and drops back to the grid.
 	m, cmd := press(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
 	m, _ = feed(t, m, cmd())
-	if m.focused || m.inputErr == nil {
-		t.Fatalf("after failure want the grid with a recorded error, got focused=%v err=%v", m.focused, m.inputErr)
+	if m.focused() || m.inputErrs[testAlias] == nil {
+		t.Fatalf("after failure want the grid with a recorded error, got focused=%v err=%v", m.focused(), m.inputErrs[testAlias])
 	}
 
 	// The Server recovers; focusing again retries the stream and forwards,
@@ -614,8 +613,8 @@ func TestFocus_RetriesAfterInputFailure(t *testing.T) {
 	m = enterFocus(t, m)
 	m, _ = press(t, m, tea.KeyPressMsg{Code: 'z', Text: "z"})
 	waitKeys(t, conn.sink, "z")
-	if m.inputErr != nil {
-		t.Errorf("inputErr not cleared on retry: %v", m.inputErr)
+	if m.inputErrs[testAlias] != nil {
+		t.Errorf("inputErr not cleared on retry: %v", m.inputErrs[testAlias])
 	}
 }
 
@@ -624,7 +623,7 @@ func TestFocus_IgnoredForExitedPane(t *testing.T) {
 	m = update(t, m, "%1", client.PaneUpdate{Exited: true})
 
 	m, cmd := press(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
-	if m.focused {
+	if m.focused() {
 		t.Error("entered passthrough into an exited Pane")
 	}
 	if cmd != nil {
@@ -637,7 +636,7 @@ func TestFocus_IgnoredWithoutALivePane(t *testing.T) {
 	m, _ := loadedModel(t, &fakeConn{})
 	m = sizeMsg(t, m, 80, 24)
 	m, cmd := press(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
-	if m.focused {
+	if m.focused() {
 		t.Error("entered passthrough with no live Pane on screen")
 	}
 	if cmd != nil {
@@ -650,21 +649,121 @@ func TestFocus_PaneExitReturnsToGrid(t *testing.T) {
 	m = enterFocus(t, m)
 
 	m = update(t, m, "%1", client.PaneUpdate{Exited: true})
-	if m.focused {
+	if m.focused() {
 		t.Error("still in passthrough after the focused Pane exited")
 	}
 	if got := viewContent(m); !strings.Contains(got, "exited") {
-		t.Errorf("the exited Pane's card wears no badge:\n%s", stripSGR(got))
+		t.Errorf("the exited Pane's card wears no badge:\n%s", ansi.Strip(got))
 	}
+}
+
+// failStream marks a Pane's render stream broken, as recvCmd would report it.
+func failStream(t *testing.T, m Model, paneID string, err error) Model {
+	t.Helper()
+	ref := testRef(paneID)
+	m, _ = feed(t, m, watchFailedMsg{ref: ref, stream: currentStream(m, ref), err: err})
+	return m
 }
 
 func TestGrid_StreamFailureWearsBadge(t *testing.T) {
 	m, _ := twoPaneModel(t)
-	m, _ = feed(t, m, watchFailedMsg{ref: testRef("%1"), err: errors.New("stream torn")})
+	m = failStream(t, m, "%1", errors.New("stream torn"))
 
 	if got := viewContent(m); !strings.Contains(got, "stream lost") {
-		t.Errorf("grid does not surface the broken stream:\n%s", stripSGR(got))
+		t.Errorf("grid does not surface the broken stream:\n%s", ansi.Strip(got))
 	}
+}
+
+func TestFocus_RefusedForABrokenStream(t *testing.T) {
+	m, _ := twoPaneModel(t)
+	m = failStream(t, m, "%1", errors.New("stream torn"))
+
+	// Focusing a stream-lost Pane would be typing into a frozen frame.
+	m, cmd := press(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
+	if m.focused() {
+		t.Error("entered passthrough into a Pane whose render stream is broken")
+	}
+	if cmd != nil {
+		t.Errorf("opened an input stream for a broken Pane, cmd=%T", cmd())
+	}
+}
+
+func TestRefresh_RewatchesABrokenStream(t *testing.T) {
+	m, conn := twoPaneModel(t)
+	m = failStream(t, m, "%1", errors.New("stream torn"))
+
+	// r refetches the Herd; the broken Pane must get a fresh watch, not
+	// stay "stream lost" forever.
+	m, cmd := press(t, m, tea.KeyPressMsg{Code: 'r', Text: "r"})
+	m, cmd = pump(t, m, cmd) // fetch -> panesLoadedMsg -> applyHerd
+	m = runWatches(t, m, cmd)
+
+	if got := conn.watchedPanes(); len(got) != 3 || got[2] != "%1" {
+		t.Fatalf("watched panes after refresh = %v, want a re-watch of %%1", got)
+	}
+	if st := m.views[testRef("%1")]; st == nil || st.err != nil {
+		t.Errorf("the broken Pane's state was not reset: %+v", st)
+	}
+}
+
+func TestWatch_StaleStreamUpdateIsDropped(t *testing.T) {
+	m, _ := twoPaneModel(t)
+
+	// An update tagged with a stream that is not the Pane's current one —
+	// the tail of a replaced watch — must never reach the grid.
+	stale := &fakeStream{}
+	m, _ = feed(t, m, paneUpdateMsg{ref: testRef("%1"), stream: stale, update: textUpdate("GHOST", 0, 2)})
+	if got := viewContent(m); strings.Contains(got, "GHOST") {
+		t.Error("a stale stream's damage reached the grid")
+	}
+
+	// Same for a stale failure: it must not mark the live stream broken.
+	m, _ = feed(t, m, watchFailedMsg{ref: testRef("%1"), stream: stale, err: errors.New("old stream torn")})
+	if st := m.views[testRef("%1")]; st.err != nil {
+		t.Error("a stale stream's failure marked the live Pane broken")
+	}
+}
+
+func TestWatch_ResizeResetsContent(t *testing.T) {
+	m, _ := twoPaneModel(t)
+	m = update(t, m, "%1", resize(30, 8))
+
+	if got := viewContent(m); strings.Contains(got, "alpha says hi") {
+		t.Errorf("content survived a resize, want a reset grid:\n%s", ansi.Strip(got))
+	}
+}
+
+func TestRefresh_FailureKeepsTheDashboard(t *testing.T) {
+	m, _ := twoPaneModel(t)
+	m, _ = feed(t, m, loadFailedMsg{err: errors.New("host went away")})
+
+	got := viewContent(m)
+	if !strings.Contains(got, "agent-a") {
+		t.Errorf("a failed refresh blanked the live dashboard:\n%s", ansi.Strip(got))
+	}
+	if !strings.Contains(got, "host went away") {
+		t.Errorf("the failed refresh is not surfaced in the footer:\n%s", ansi.Strip(got))
+	}
+}
+
+func TestFocus_RestoreSurvivesQuickRefocus(t *testing.T) {
+	m, conn := twoPaneModel(t) // pane %1 is 20x5, viewport 120x30
+	m = enterFocus(t, m)
+
+	// Unfocus queues the restore, then refocus lands before the restore's
+	// PaneResized round-trips: the grid still reads the viewport size, and
+	// naively sampling it would adopt 120x30 as the size to restore to.
+	m, _ = press(t, m, tea.KeyPressMsg{Code: '\\', Mod: tea.ModCtrl})
+	m = update(t, m, "%1", resize(120, 30)) // the focus resize echoing back, late
+	m = enterFocus(t, m)
+	_, _ = press(t, m, tea.KeyPressMsg{Code: '\\', Mod: tea.ModCtrl})
+
+	waitResizes(t, conn.sink,
+		resizeCall{pane: "%1", size: grid.Size{W: 120, H: 30}}, // focus
+		resizeCall{pane: "%1", size: grid.Size{W: 20, H: 5}},   // restore
+		resizeCall{pane: "%1", size: grid.Size{W: 120, H: 30}}, // refocus
+		resizeCall{pane: "%1", size: grid.Size{W: 20, H: 5}},   // the true size again
+	)
 }
 
 func TestNewServers_RejectsDuplicateAliases(t *testing.T) {
@@ -732,7 +831,8 @@ func TestHerd_TwoServersShareIdsWithoutCollision(t *testing.T) {
 
 	// Make alpha's pane live, focus it, and type: the input reaches alpha's
 	// Server only, even though beta owns a pane with the same bare id.
-	m, _ = feed(t, m, paneUpdateMsg{ref: herd.PaneRef{Host: "alpha", ID: "%0"}, update: resize(10, 3)})
+	alphaRef := herd.PaneRef{Host: "alpha", ID: "%0"}
+	m, _ = feed(t, m, paneUpdateMsg{ref: alphaRef, stream: currentStream(m, alphaRef), update: resize(10, 3)})
 	m = enterFocus(t, m)
 	m, _ = press(t, m, tea.KeyPressMsg{Code: 'z', Text: "z"})
 	waitKeys(t, alpha.sink, "z")

@@ -118,12 +118,7 @@ func goldenModel(t *testing.T, conn *fakeConn) *teatest.TestModel {
 	t.Cleanup(cancel)
 
 	tm := teatest.NewTestModel(t, New(ctx, single(conn)), teatest.WithInitialTermSize(120, 36))
-	teatest.WaitFor(t, tm.Output(), func(bts []byte) bool {
-		s := ansi.Strip(string(bts))
-		return strings.Contains(s, "api refactor") &&
-			strings.Contains(s, "FAIL internal/tui") &&
-			strings.Contains(s, "Release notes")
-	}, teatest.WithDuration(testutil.WaitTimeout))
+	waitForFrame(t, tm, "api refactor", "FAIL internal/tui", "Release notes")
 	return tm
 }
 
@@ -145,9 +140,7 @@ func TestGolden_FocusView(t *testing.T) {
 	// Focus the first Pane; the edge marker only fits the full-screen view,
 	// so its appearance is the focus transition completing.
 	tm.Send(tea.KeyPressMsg{Code: tea.KeyEnter})
-	teatest.WaitFor(t, tm.Output(), func(bts []byte) bool {
-		return strings.Contains(ansi.Strip(string(bts)), "EDGE-MARKER")
-	}, teatest.WithDuration(testutil.WaitTimeout))
+	waitForFrame(t, tm, "EDGE-MARKER")
 
 	// 'q' would be forwarded to the Pane in passthrough; end the program
 	// directly instead.

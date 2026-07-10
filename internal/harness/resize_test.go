@@ -51,8 +51,9 @@ func TestListPanes_TitleFallsBackToWindowName(t *testing.T) {
 // TestResize_RequestResizesPaneAndReseeds is the Server half of the
 // resize-on-focus contract (#11): a ResizeRequest on the Control Input
 // stream resizes the Pane's tmux window, and the watcher relays the change
-// to every watcher as a PaneResized plus a re-seed of the authoritative
-// screen — the same confirmation path as a tmux-initiated resize.
+// to every render-stream subscriber as a PaneResized plus a re-seed of the
+// authoritative screen — the same confirmation path as a tmux-initiated
+// resize.
 func TestResize_RequestResizesPaneAndReseeds(t *testing.T) {
 	t.Parallel()
 	h := Start(t)

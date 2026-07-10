@@ -14,7 +14,7 @@ func renderPane(g *grid.Grid, cursor grid.Cursor) string {
 	return renderRegion(g, cursor, 0, 0, w, h)
 }
 
-// renderRegion draws the w×h window of g anchored at (x0, y0) — the whole
+// renderRegion draws the w×h region of g anchored at (x0, y0) — the whole
 // grid for a focused Pane, a cropped live thumbnail for a card. Styles are
 // emitted as raw SGR sequences grouped into runs — a per-cell lipgloss style
 // would re-emit codes for every cell.

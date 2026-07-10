@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -13,14 +15,17 @@ import (
 
 // View renders the dashboard full-screen: the Pane grid, or the focused
 // Pane, or one of the whole-dashboard states (connecting, load failure).
+// A fetch failure is full-screen only while there is no Herd to show; once
+// cards are up, a failed refresh reports in the footer — never by blanking
+// live Panes.
 func (m Model) View() tea.View {
 	var content string
 	switch {
 	case !m.loaded:
 		content = m.centered(stylePlaceholder.Render("Connecting to the Herd..."))
-	case m.err != nil:
+	case m.err != nil && len(m.panes) == 0:
 		content = m.centered(styleError.Render("Cannot reach the Herd: " + m.err.Error()))
-	case m.focused:
+	case m.focused():
 		content = m.focusView()
 	default:
 		content = m.gridView()
@@ -52,23 +57,25 @@ func (m Model) focusView() string {
 	return renderRegion(st.view.Grid, st.view.Cursor, 0, 0, min(gw, m.width), min(gh, m.height))
 }
 
-// gridView is the dashboard proper: header, the card grid, footer.
+// gridView is the dashboard proper: header, the card grid, footer. The
+// layout is computed once per frame and shared, so the cards and the
+// footer's scroll markers can never disagree about what is on screen.
 func (m Model) gridView() string {
-	availH := max(m.height-headerRows-footerRows, minCardH)
+	l := layoutCards(m.width, m.height, len(m.panes))
 
 	var body string
 	if len(m.panes) == 0 {
 		body = "The Herd is empty\n" + styleNote.Render("Spawn or Adopt an Agent on a Host, then press r")
 		body = lipgloss.NewStyle().Align(lipgloss.Center).Render(body)
 	} else {
-		body = m.cardsView()
+		body = m.cardsView(l)
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Left,
 		m.headerView(),
 		"",
-		lipgloss.Place(m.width, availH, lipgloss.Center, lipgloss.Center, body),
-		m.footerView(),
+		lipgloss.Place(m.width, l.availH, lipgloss.Center, lipgloss.Center, body),
+		m.footerView(l),
 	)
 }
 
@@ -81,8 +88,9 @@ func (m Model) headerView() string {
 }
 
 // footerView is the key legend, plus scroll markers when card rows are off
-// screen and the input-stream failure when passthrough is unavailable.
-func (m Model) footerView() string {
+// screen, failed-refresh notice, and input-stream failures when passthrough
+// is unavailable.
+func (m Model) footerView(l cardLayout) string {
 	hint := func(key, action string) string {
 		return styleKey.Render(key) + " " + styleNote.Render(action)
 	}
@@ -95,24 +103,31 @@ func (m Model) footerView() string {
 		hint("q", "quit"),
 	}, sep)
 
-	if n := len(m.panes); n > 0 {
-		l := layoutCards(m.width, m.height, n)
-		if off := l.rowOffset(m.selected); off > 0 {
-			legend = styleNote.Render("▲ more  ") + legend
-		} else if l.rows > l.visibleRows {
-			legend = styleNote.Render("▼ more  ") + legend
+	if len(m.panes) > 0 {
+		off := l.rowOffset(m.selected)
+		var markers string
+		if off > 0 {
+			markers += "▲ "
+		}
+		if off+l.visibleRows < l.rows {
+			markers += "▼ "
+		}
+		if markers != "" {
+			legend = styleNote.Render(markers+"more  ") + legend
 		}
 	}
-	if m.inputErr != nil {
-		legend += sep + styleError.Render("input unavailable: "+m.inputErr.Error())
+	if m.err != nil {
+		legend += sep + styleError.Render("refresh failed: "+m.err.Error())
+	}
+	for _, host := range slices.Sorted(maps.Keys(m.inputErrs)) {
+		legend += sep + styleError.Render(fmt.Sprintf("input unavailable (%s): %v", host, m.inputErrs[host]))
 	}
 	return " " + legend
 }
 
 // cardsView tiles the Herd into the card grid, scrolled so the selected
 // card is always on screen.
-func (m Model) cardsView() string {
-	l := layoutCards(m.width, m.height, len(m.panes))
+func (m Model) cardsView(l cardLayout) string {
 	off := l.rowOffset(m.selected)
 
 	gutterCol := strings.Repeat(" ", gutterX)
@@ -159,48 +174,48 @@ func (m Model) renderCard(p refPane, w, h int, selected bool) string {
 	var b strings.Builder
 	b.WriteString(cardTop(border, title, label, iw))
 	b.WriteByte('\n')
+	edge := border.Render("│")
 	for _, row := range m.cardBody(ref, iw, ih) {
-		b.WriteString(border.Render("│"))
+		b.WriteString(edge)
 		b.WriteString(row)
-		b.WriteString(border.Render("│"))
+		b.WriteString(edge)
 		b.WriteByte('\n')
 	}
 	b.WriteString(cardBottom(border, m.views[ref], ref, iw))
 	return b.String()
 }
 
-// cardTop renders `╭─ title ────╮`, the title truncated to fit.
+// cardTop renders `╭─ title ────╮`, the title truncated to fit. Border rows
+// are measured (lipgloss.Width of the decorated segments), never offset-
+// counted, so changing a decoration cannot desync the width math.
 func cardTop(border, title lipgloss.Style, label string, iw int) string {
-	label = ansi.Truncate(label, max(iw-4, 0), "…")
-	fill := max(iw-lipgloss.Width(label)-3, 0)
-	return border.Render("╭─ ") + title.Render(label) + border.Render(" "+strings.Repeat("─", fill)+"╮")
+	head := border.Render("─ ") + title.Render(ansi.Truncate(label, max(iw-4, 0), "…")) + border.Render(" ")
+	fill := strings.Repeat("─", max(iw-lipgloss.Width(head), 0))
+	return border.Render("╭") + head + border.Render(fill+"╮")
 }
 
 // cardBottom renders `╰─ badge ───── host:%1 ─╯`: an optional lifecycle
 // badge on the left, the PaneRef on the right, either dropped — badge first
 // — when the card is too narrow for both.
 func cardBottom(border lipgloss.Style, st *paneState, ref herd.PaneRef, iw int) string {
-	var badge, refPart string
-	var badgeW, refW int
-
+	var lead, tail string
 	if label := ansi.Truncate(ref.String(), max(iw-4, 0), "…"); iw >= lipgloss.Width(label)+4 {
-		refW = lipgloss.Width(label) + 3
-		refPart = border.Render(" ") + styleRef.Render(label) + border.Render(" ─")
+		tail = border.Render(" ") + styleRef.Render(label) + border.Render(" ─")
 	}
 	if text, style, ok := lifecycleBadge(st); ok {
-		if w := lipgloss.Width(text) + 3; iw >= refW+w+1 {
-			badgeW = w
-			badge = border.Render("─ ") + style.Render(text) + border.Render(" ")
+		candidate := border.Render("─ ") + style.Render(text) + border.Render(" ")
+		if iw >= lipgloss.Width(candidate)+lipgloss.Width(tail)+1 {
+			lead = candidate
 		}
 	}
 
-	fill := strings.Repeat("─", max(iw-badgeW-refW, 0))
-	return border.Render("╰") + badge + border.Render(fill) + refPart + border.Render("╯")
+	fill := strings.Repeat("─", max(iw-lipgloss.Width(lead)-lipgloss.Width(tail), 0))
+	return border.Render("╰") + lead + border.Render(fill) + tail + border.Render("╯")
 }
 
-// lifecycleBadge names the state a card should wear on its frame: nothing
-// for a live Pane, "exited" for a Pane whose process ended (the final
-// screen stays up), "stream lost" when its render stream broke.
+// lifecycleBadge names the condition a card should wear on its frame:
+// nothing for a live Pane, "exited" for a Pane whose process ended (the
+// final screen stays up), "stream lost" when its render stream broke.
 func lifecycleBadge(st *paneState) (string, lipgloss.Style, bool) {
 	switch {
 	case st == nil:

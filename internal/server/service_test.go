@@ -218,8 +218,8 @@ func TestSendInput_DropsImplausibleResize(t *testing.T) {
 	for _, ev := range []*shevetv1.InputEvent{
 		resizeEvent("%1", 0, 24),
 		resizeEvent("%1", 80, 0),
-		resizeEvent("%1", maxPaneDim+1, 24),
-		resizeEvent("%1", 80, maxPaneDim+1),
+		resizeEvent("%1", maxResizeDim+1, 24), // past tmux's cap: would bounce as %error
+		resizeEvent("%1", 80, maxResizeDim+1),
 	} {
 		stream.in <- scriptedInput{ev: ev}
 	}

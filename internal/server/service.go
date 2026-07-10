@@ -198,17 +198,24 @@ func (s *herdService) injectKeys(ctx context.Context, keys *shevetv1.KeyBytes, s
 	return nil
 }
 
+// maxResizeDim bounds accepted resize requests to what tmux itself allows
+// (WINDOW_MAXIMUM, 10000): a request past it would not be applied but would
+// come back as a tmux %error — which, like any injection error, ends the
+// whole Control Input stream. Dropping it here keeps a garbled request from
+// costing the Client its keystroke stream. Stricter than maxPaneDim, which
+// bounds what the Server accepts *from* tmux, not what it asks of it.
+const maxResizeDim = 10000
+
 // injectResize realizes one ResizeRequest against tmux. A request for a Pane
 // not in the Herd is dropped like a keystroke would be (the Pane can exit
-// while the request is in flight), and so is an implausible geometry — the
-// same bound the watcher applies to tmux's own reports — so a garbled request
-// never reaches tmux. Confirmation is not synthesized here: tmux reports the
-// resize and the watcher relays it to every watcher of the Pane as a
-// PaneResized plus a re-seed.
+// while the request is in flight), and so is a geometry tmux would refuse —
+// so a garbled request never reaches tmux. Confirmation is not synthesized
+// here: tmux reports the resize and the watcher relays it to every
+// subscriber of the Pane's render pipeline as a PaneResized plus a re-seed.
 func (s *herdService) injectResize(ctx context.Context, req *shevetv1.ResizeRequest, summary *shevetv1.SendInputSummary) error {
 	paneID := req.GetPaneId()
 	w, h := int(req.GetWidth()), int(req.GetHeight())
-	if w <= 0 || h <= 0 || w > maxPaneDim || h > maxPaneDim {
+	if w <= 0 || h <= 0 || w > maxResizeDim || h > maxResizeDim {
 		return nil
 	}
 	if s.hub.get(paneID) == nil {

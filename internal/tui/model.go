@@ -115,10 +115,14 @@ func (p refPane) Ref() herd.PaneRef {
 
 // paneState is the Client-side live state of one watched Pane: the render
 // stream folded into a local grid, plus the stream's failure if it broke
-// (the last frame stays renderable behind the badge).
+// (the last frame stays renderable behind the badge). stream identifies the
+// watch this state is fed by — updates from any other stream (a tail
+// outliving a refresh, a watch replaced after a failure) are stale and must
+// be dropped, never applied.
 type paneState struct {
-	view *client.PaneView
-	err  error
+	view   *client.PaneView
+	stream PaneStream
+	err    error
 }
 
 // Model is the dashboard's Bubble Tea model. Construct with New.
@@ -149,18 +153,32 @@ type Model struct {
 
 	// Focus state. The grid is read-only; focusing a Pane switches to
 	// passthrough, where keystrokes are encoded and forwarded and only the
-	// leader (Ctrl-\) returns. restore is the focused Pane's pre-focus
-	// canonical size, sent back as a resize on unfocus.
-	focused bool
+	// leader (Ctrl-\) returns. focus is the focused Pane, zero on the grid
+	// (a real PaneRef always carries a Host alias). restore is the focused
+	// Pane's pre-focus canonical size, sent back as a resize on unfocus.
+	//
+	// pending tracks restores that have been sent (or should have been) but
+	// not yet confirmed by a PaneResized. It is what makes the pre-focus
+	// size survive a quick unfocus→refocus: the Client-side grid still
+	// reads the viewport size until the restore round-trips through tmux,
+	// so sampling it again would adopt the viewport as the size to restore
+	// to — and the Pane's true size would be lost for good.
 	focus   herd.PaneRef
 	restore grid.Size
+	pending map[herd.PaneRef]grid.Size
 
 	// Input plumbing: one forwarding channel per Host, opened lazily on the
 	// first focus of one of its Panes and drained onto that Host's Control
-	// Input stream by a forwarding Cmd. inputErr records a stream that could
-	// not open or broke; focusing again retries.
-	inputs   map[string]chan inputReq
-	inputErr error
+	// Input stream by a forwarding Cmd. inputErrs records, per Host, a
+	// stream that could not open or broke; focusing a Pane on that Host
+	// again retries.
+	inputs    map[string]chan inputReq
+	inputErrs map[string]error
+}
+
+// focused reports whether a Pane holds the dashboard's focus (passthrough).
+func (m Model) focused() bool {
+	return m.focus != herd.PaneRef{}
 }
 
 // New returns a dashboard Model that will populate itself from the given
@@ -171,11 +189,13 @@ func New(ctx context.Context, servers []Server) Model {
 		conns[s.Alias] = s.Conn
 	}
 	return Model{
-		servers: servers,
-		conns:   conns,
-		ctx:     ctx,
-		views:   make(map[herd.PaneRef]*paneState),
-		inputs:  make(map[string]chan inputReq),
+		servers:   servers,
+		conns:     conns,
+		ctx:       ctx,
+		views:     make(map[herd.PaneRef]*paneState),
+		pending:   make(map[herd.PaneRef]grid.Size),
+		inputs:    make(map[string]chan inputReq),
+		inputErrs: make(map[string]error),
 	}
 }
 
@@ -207,8 +227,9 @@ type paneUpdateMsg struct {
 }
 
 type watchFailedMsg struct {
-	ref herd.PaneRef
-	err error
+	ref    herd.PaneRef
+	stream PaneStream // nil when the watch never opened
+	err    error
 }
 
 // inputFailedMsg reports that a Host's Control Input stream could not open
@@ -262,12 +283,14 @@ func watchPaneCmd(ctx context.Context, conn Conn, ref herd.PaneRef) tea.Cmd {
 }
 
 // recvCmd waits for the next update on one Pane's stream. Update re-issues
-// it after every received message, forming the per-Pane receive loop.
+// it after every received message, forming the per-Pane receive loop. The
+// stream rides along on every message as the loop's identity: Update honors
+// a message only while this stream is still the one its paneState is fed by.
 func recvCmd(ref herd.PaneRef, stream PaneStream) tea.Cmd {
 	return func() tea.Msg {
 		u, err := stream.Recv()
 		if err != nil {
-			return watchFailedMsg{ref: ref, err: err}
+			return watchFailedMsg{ref: ref, stream: stream, err: err}
 		}
 		return paneUpdateMsg{ref: ref, stream: stream, update: u}
 	}
@@ -336,7 +359,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		if m.focused {
+		if m.focused() {
 			// The viewport is the focused Pane's size; track it.
 			m.queueResize(m.focus, grid.Size{W: m.width, H: m.height})
 		}
@@ -348,55 +371,97 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.applyHerd(msg)
 
 	case loadFailedMsg:
+		// A failed fetch. Before anything has loaded this is the whole
+		// story (View shows it full-screen); once a Herd is on screen it is
+		// only a failed refresh — the dashboard and its live streams are
+		// untouched, so the error surfaces in the footer instead.
 		m.err = msg.err
 		m.loaded = true
 
 	case watchStartedMsg:
+		st := m.views[msg.ref]
+		if st == nil {
+			// The Pane left the Herd while the watch was opening. Nothing
+			// reads this stream; the Server ends it when the pane exits.
+			return m, nil
+		}
+		st.stream = msg.stream
 		return m, recvCmd(msg.ref, msg.stream)
 
 	case paneUpdateMsg:
 		st := m.views[msg.ref]
-		if st == nil {
-			return m, nil // the Pane left the Herd on a refresh; drop the tail
+		if st == nil || st.stream != msg.stream {
+			// The Pane left the Herd, or this update is the tail of a
+			// replaced stream: stale either way, and applying it would
+			// interleave two streams' damage into one grid. Drop it and
+			// let the loop end.
+			return m, nil
 		}
 		st.view.Apply(msg.update)
+		if r := msg.update.Resized; r != nil && m.focus != msg.ref {
+			// A resize landed while we are not driving the Pane. If it is
+			// the viewport size we imposed, it is only the focus resize
+			// echoing back late — the pending restore is still the truth.
+			// Anything else means the restore (or an external resize
+			// superseding it) applied: the canonical size is trustworthy
+			// again, so the pending entry has served its purpose.
+			if *r != (grid.Size{W: m.width, H: m.height}) {
+				delete(m.pending, msg.ref)
+			}
+		}
 		if st.view.Exited {
-			if m.focused && m.focus == msg.ref {
+			if m.focus == msg.ref {
 				// The focused Pane exited under our fingers: back to the
 				// grid. Its card keeps the final screen; nothing to restore.
-				m.focused = false
+				m.focus = herd.PaneRef{}
 			}
+			delete(m.pending, msg.ref)
 			return m, nil // stream is over; the Server sends nothing after exited
 		}
 		return m, recvCmd(msg.ref, msg.stream)
 
 	case watchFailedMsg:
-		if st := m.views[msg.ref]; st != nil {
-			st.err = msg.err
+		st := m.views[msg.ref]
+		if st == nil || st.stream != msg.stream {
+			return m, nil // a departed Pane's or replaced stream's tail
 		}
-		if m.focused && m.focus == msg.ref {
+		st.err = msg.err
+		if m.focus == msg.ref {
 			// Blind passthrough is a trap: drop to the grid, where the card
 			// wears the failure. The Pane itself may be fine, so its size is
 			// still restored.
-			m.focused = false
-			m.queueResize(msg.ref, m.restore)
+			m.unfocus()
 		}
 
 	case inputFailedMsg:
 		// This Host's passthrough is unavailable; drop back to the grid but
 		// keep rendering. Focusing again retries with a fresh stream.
-		m.inputErr = msg.err
+		m.inputErrs[msg.host] = msg.err
 		delete(m.inputs, msg.host)
-		if m.focused && m.focus.Host == msg.host {
-			m.focused = false
+		if m.focus.Host == msg.host {
+			// The restore cannot be sent — the stream died with it — but
+			// recording it as pending means the next focus/unfocus cycle
+			// still restores the true pre-focus size.
+			m.pending[m.focus] = m.restore
+			m.focus = herd.PaneRef{}
 		}
 	}
 	return m, nil
 }
 
+// unfocus returns to the grid, sending the focused Pane its pre-focus size
+// and remembering it as pending until a PaneResized confirms it landed.
+func (m *Model) unfocus() {
+	m.queueResize(m.focus, m.restore)
+	m.pending[m.focus] = m.restore
+	m.focus = herd.PaneRef{}
+}
+
 // applyHerd folds a (re)fetched Herd into the model: Panes still present
-// keep their live state, new ones start watching, gone ones are dropped.
-// The selection follows the Pane it was on, falling back to the first card.
+// keep their live state, new ones start watching, Panes whose stream broke
+// start over with a fresh watch (this is what makes `r` the recovery
+// gesture for a "stream lost" card), gone ones are dropped. The selection
+// follows the Pane it was on, falling back to the first card.
 func (m Model) applyHerd(panes []refPane) (tea.Model, tea.Cmd) {
 	var selectedRef herd.PaneRef
 	if m.selected < len(m.panes) {
@@ -416,7 +481,10 @@ func (m Model) applyHerd(panes []refPane) (tea.Model, tea.Cmd) {
 		if ref == selectedRef {
 			m.selected = i
 		}
-		if m.views[ref] == nil {
+		if st := m.views[ref]; st == nil || st.err != nil {
+			// A fresh paneState: its stream field is what makes any tail of
+			// the replaced stream stale, so the old and new watch can never
+			// interleave damage into one grid.
 			m.views[ref] = &paneState{view: client.NewPaneView()}
 			cmds = append(cmds, watchPaneCmd(m.ctx, m.conns[p.Host], ref))
 		}
@@ -424,10 +492,11 @@ func (m Model) applyHerd(panes []refPane) (tea.Model, tea.Cmd) {
 	for ref := range m.views {
 		if !live[ref] {
 			delete(m.views, ref)
+			delete(m.pending, ref)
 		}
 	}
-	if m.focused && !live[m.focus] {
-		m.focused = false
+	if m.focused() && !live[m.focus] {
+		m.focus = herd.PaneRef{}
 	}
 	return m, tea.Batch(cmds...)
 }
@@ -437,10 +506,9 @@ func (m Model) applyHerd(panes []refPane) (tea.Model, tea.Cmd) {
 // encoded and forwarded to the focused Pane except the reserved leader,
 // which returns to the grid and restores the Pane's pre-focus size.
 func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	if m.focused {
+	if m.focused() {
 		if isLeader(msg) {
-			m.focused = false
-			m.queueResize(m.focus, m.restore)
+			m.unfocus()
 			return m, nil
 		}
 		if data := encodeKey(msg); len(data) > 0 {
@@ -490,21 +558,29 @@ func (m *Model) moveSelection(dx, dy int) {
 // focusSelected enters the selected Pane: passthrough input, full-screen
 // view, and the Pane resized to the Client viewport. The Pane's canonical
 // size at this moment is remembered and restored on unfocus. Focusing needs
-// a live, sized Pane and a known viewport; otherwise the key is ignored.
+// a live, sized Pane — one whose render stream is up, or passthrough would
+// be typing into a frozen frame — and a known viewport; otherwise the key
+// is ignored.
 func (m Model) focusSelected() (Model, tea.Cmd) {
 	if m.selected >= len(m.panes) || m.width <= 0 || m.height <= 0 {
 		return m, nil
 	}
 	ref := m.panes[m.selected].Ref()
 	st := m.views[ref]
-	if st == nil || st.view.Exited || !sized(st.view.Grid) {
+	if st == nil || st.err != nil || st.view.Exited || !sized(st.view.Grid) {
 		return m, nil
 	}
 
-	m.focused = true
 	m.focus = ref
-	w, h := st.view.Grid.Size()
-	m.restore = grid.Size{W: w, H: h}
+	if p, ok := m.pending[ref]; ok {
+		// A restore is still in flight for this Pane, so the grid reads a
+		// size we imposed, not the Pane's own. The pending target is the
+		// true pre-focus size; keep restoring to it.
+		m.restore = p
+	} else {
+		w, h := st.view.Grid.Size()
+		m.restore = grid.Size{W: w, H: h}
+	}
 
 	// Open this Host's input stream when there isn't a live one — including
 	// a retry after a prior failure. Requests issued before the stream opens
@@ -512,7 +588,7 @@ func (m Model) focusSelected() (Model, tea.Cmd) {
 	var cmd tea.Cmd
 	ch := m.inputs[ref.Host]
 	if ch == nil {
-		m.inputErr = nil
+		delete(m.inputErrs, ref.Host)
 		ch = make(chan inputReq, forwardBuffer)
 		m.inputs[ref.Host] = ch
 		cmd = forwardInputCmd(m.ctx, m.conns[ref.Host], ref.Host, ch)

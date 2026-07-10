@@ -19,11 +19,14 @@ const (
 
 // cardLayout is the computed shape of the dashboard grid for one viewport
 // and Pane count: how many card columns and rows, each card's outer size,
-// and how many card rows fit on screen at once (the rest scroll).
+// how many card rows fit on screen at once (the rest scroll), and the body
+// height the cards are placed in (viewport minus chrome — kept here so the
+// card math and the view can never disagree about it).
 type cardLayout struct {
 	cols, rows   int
 	cardW, cardH int
 	visibleRows  int
+	availH       int
 }
 
 // layoutCards computes the card grid for a viewport. It is total: any
@@ -45,6 +48,7 @@ func layoutCards(viewportW, viewportH, n int) cardLayout {
 		cardW:       max(cardW, 8), // never thinner than its own corners
 		cardH:       cardH,
 		visibleRows: min(visible, rows),
+		availH:      availH,
 	}
 }
 
