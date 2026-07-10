@@ -434,9 +434,7 @@ func (w *watcher) seed(ctx context.Context, paneID string, wp *watchedPane) erro
 	if err != nil {
 		return err
 	}
-	if len(replies) != 2 {
-		return fmt.Errorf("seed pane %s: want 2 replies, got %d", paneID, len(replies))
-	}
+	// CommandsSeq returns one reply body per command on success.
 	rows, cursor := replies[0], replies[1]
 	cx, cy := 0, 0
 	if len(cursor) == 1 {
