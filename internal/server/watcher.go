@@ -110,9 +110,11 @@ const (
 	// pause/resume loop that would burn CPU.
 	resumeDelay = 100 * time.Millisecond
 
-	// resumeQueue bounds pending resume signals. At most one is outstanding
-	// per paused pane (a pane stays paused until it resumes), so a whole
-	// Herd's worth of panes never comes close to filling it.
+	// resumeQueue is the resume-signal channel's buffer. At most one signal is
+	// outstanding per paused pane (a pane stays paused until it resumes), so
+	// this absorbs a whole Herd's worth without a timer ever having to wait;
+	// beyond it, scheduleResume blocks rather than dropping, so a resume is
+	// never lost (see scheduleResume).
 	resumeQueue = 256
 )
 
@@ -130,6 +132,10 @@ type watcher struct {
 	// resumeCh carries pane ids whose scheduled resume is due. A timer per
 	// pause feeds it; run drains it and re-seeds the pane (ADR-0008).
 	resumeCh chan string
+
+	// done is closed when the watcher tears down, releasing any resume timers
+	// still waiting to hand their pane to run.
+	done chan struct{}
 }
 
 // attachWatcher attaches to tmux in control mode and performs the initial
@@ -149,6 +155,7 @@ func attachWatcher(ctx context.Context, opts TmuxOptions, registry *Registry, hu
 		hub:      hub,
 		log:      log,
 		resumeCh: make(chan string, resumeQueue),
+		done:     make(chan struct{}),
 	}
 	if err := w.reconcile(ctx); err != nil {
 		w.teardown()
@@ -165,6 +172,7 @@ func (w *watcher) commander() inject.Commander { return w.ctl }
 
 // teardown empties the Herd, closes every pipeline, and detaches from tmux.
 func (w *watcher) teardown() {
+	close(w.done) // release resume timers still waiting on run
 	w.registry.Replace(nil)
 	for _, wp := range w.hub.drain() {
 		wp.pipe.close(false)
@@ -284,15 +292,16 @@ func (w *watcher) pausePane(ctx context.Context, paneID string, wp *watchedPane)
 	w.scheduleResume(paneID)
 }
 
-// scheduleResume asks run to resume paneID after resumeDelay. The send is
-// best-effort: a full resumeCh would only mean a resume is already pending for
-// this pane, which cannot happen (a pane stays paused until it resumes), so in
-// practice it never drops.
+// scheduleResume asks run to resume paneID after resumeDelay. The send never
+// drops: resumeCh buffers a whole Herd's worth of pending resumes, and if it
+// somehow fills the timer waits for run to drain one rather than lose the only
+// signal that would unpause the pane. It aborts on teardown so the timer
+// goroutine can never outlive the watcher.
 func (w *watcher) scheduleResume(paneID string) {
 	time.AfterFunc(resumeDelay, func() {
 		select {
 		case w.resumeCh <- paneID:
-		default:
+		case <-w.done:
 		}
 	})
 }
