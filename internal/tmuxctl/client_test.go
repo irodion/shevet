@@ -64,6 +64,52 @@ func TestAttach_FailsWithoutServer(t *testing.T) {
 	}
 }
 
+// TestOutput_ByteFidelityUnderFlowControl is TestOutput_ByteFidelity with
+// pause-after set: once flow control is on, tmux delivers pane output as
+// %extended-output instead of %output (ADR-0008), and the decoded bytes must
+// be byte-identical — the parser handling both forms is load-bearing.
+func TestOutput_ByteFidelityUnderFlowControl(t *testing.T) {
+	t.Parallel()
+	tm := tmuxtest.Start(t)
+	c, err := tmuxctl.Attach(context.Background(), tmuxctl.Options{
+		Socket:     tm.Socket(),
+		Session:    "holder",
+		PauseAfter: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	t.Cleanup(func() { c.Close() }) //nolint:errcheck // best-effort teardown
+
+	corpus := "plain\ntab\there\n\x1b[31mred\x1b[0m\x1b[1;5H\nutf8 你好 café 👩‍🚀\nback\\slash\ncontrol \x01\x06\x7f end\n"
+	want := []byte(strings.ReplaceAll(corpus, "\n", "\r\n"))
+
+	path := filepath.Join(testutil.ShortDir(t), "corpus.bin")
+	if err := os.WriteFile(path, []byte(corpus), 0o600); err != nil {
+		t.Fatalf("write corpus: %v", err)
+	}
+	pane := tm.NewWindow(t, "corpus", "cat "+tmuxtest.ShellQuote(path)+"; sleep 86400")
+
+	var got []byte
+	deadline := time.After(testutil.WaitTimeout)
+	for len(got) < len(want) {
+		select {
+		case ev, ok := <-c.Events():
+			if !ok {
+				t.Fatalf("event stream ended early; got %d/%d bytes: %q", len(got), len(want), got)
+			}
+			if out, isOut := ev.(tmuxctl.OutputEvent); isOut && out.PaneID == pane {
+				got = append(got, out.Data...)
+			}
+		case <-deadline:
+			t.Fatalf("timed out; got %d/%d bytes: %q", len(got), len(want), got)
+		}
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("output bytes differ under flow control:\n got  %q\n want %q", got, want)
+	}
+}
+
 func TestCommand_RepliesAndQuoting(t *testing.T) {
 	t.Parallel()
 	tm := tmuxtest.Start(t)

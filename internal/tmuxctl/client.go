@@ -14,8 +14,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -39,7 +41,22 @@ type Options struct {
 	// control client receives output and topology notifications for this
 	// session's panes. Required.
 	Session string
+
+	// PauseAfter, when > 0, sets tmux's pause-after flow-control flag to this
+	// many seconds (rounded up, minimum 1): output that tmux has buffered for
+	// the client longer than this pauses the pane rather than growing without
+	// bound (ADR-0008). It is the whole-stream backstop; the Server also
+	// pauses individual saturated panes itself. Requires tmux ≥ 3.2.
+	PauseAfter time.Duration
 }
+
+// minTmuxMajor and minTmuxMinor are the floor Shevet supports: control-mode
+// pause flow control (pause-after, %pause/%continue, %extended-output) shipped
+// in tmux 3.2 (ADR-0008).
+const (
+	minTmuxMajor = 3
+	minTmuxMinor = 2
+)
 
 // Client is one control-mode attachment to a tmux server. Construct with
 // Attach; always Close. Command is safe for concurrent use.
@@ -81,6 +98,9 @@ type Client struct {
 func Attach(ctx context.Context, opts Options) (*Client, error) {
 	if opts.Session == "" {
 		return nil, errors.New("tmuxctl: session must not be empty")
+	}
+	if err := checkVersion(ctx); err != nil {
+		return nil, err
 	}
 
 	args := []string{"-C"}
@@ -131,7 +151,79 @@ func Attach(ctx context.Context, opts Options) (*Client, error) {
 		c.Close() //nolint:errcheck // already failing; process cleanup only
 		return nil, fmt.Errorf("tmuxctl: attach to session %q: %w", opts.Session, err)
 	}
+
+	// Enable flow control on this control client. Setting it here (not via the
+	// attach args) keeps it one well-defined command after the attach is
+	// proven live, and switches pane output to the %extended-output form.
+	if opts.PauseAfter > 0 {
+		secs := int(math.Ceil(opts.PauseAfter.Seconds()))
+		if secs < 1 {
+			secs = 1
+		}
+		if _, err := c.Command(probeCtx, "refresh-client", "-f", fmt.Sprintf("pause-after=%d", secs)); err != nil {
+			c.Close() //nolint:errcheck // already failing; process cleanup only
+			return nil, fmt.Errorf("tmuxctl: enable pause-after flow control: %w", err)
+		}
+	}
 	return c, nil
+}
+
+// checkVersion fails when the tmux binary is older than the control-mode
+// flow-control floor (ADR-0008). tmux -V reports the binary version and needs
+// no socket; a version string Shevet cannot parse (a development build such as
+// "tmux next-3.5" or "tmux master") is allowed through rather than blocking an
+// upgrade.
+func checkVersion(ctx context.Context) error {
+	out, err := exec.CommandContext(ctx, "tmux", "-V").Output()
+	if err != nil {
+		return fmt.Errorf("tmuxctl: determine tmux version: %w", err)
+	}
+	version := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(out)), "tmux "))
+	major, minor, ok := parseVersion(version)
+	if !ok {
+		return nil
+	}
+	if belowFloor(major, minor) {
+		return fmt.Errorf("tmuxctl: tmux %s is too old: Shevet needs tmux %d.%d or newer for "+
+			"control-mode flow control (pause-after); please upgrade tmux",
+			version, minTmuxMajor, minTmuxMinor)
+	}
+	return nil
+}
+
+// belowFloor reports whether a major.minor version is older than the supported
+// tmux floor.
+func belowFloor(major, minor int) bool {
+	return major < minTmuxMajor || (major == minTmuxMajor && minor < minTmuxMinor)
+}
+
+// parseVersion extracts the leading major.minor from a tmux version string,
+// tolerating a "next-" prefix (development builds) and a trailing letter
+// (OpenBSD portable releases, e.g. "3.2a"). It reports ok=false when no
+// major.minor is present, which the caller treats as "assume new enough".
+func parseVersion(v string) (major, minor int, ok bool) {
+	v = strings.TrimPrefix(v, "next-")
+	dot := strings.IndexByte(v, '.')
+	if dot <= 0 {
+		return 0, 0, false
+	}
+	major, err := strconv.Atoi(v[:dot])
+	if err != nil {
+		return 0, 0, false
+	}
+	rest := v[dot+1:]
+	end := 0
+	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0, 0, false
+	}
+	minor, err = strconv.Atoi(rest[:end])
+	if err != nil {
+		return 0, 0, false
+	}
+	return major, minor, true
 }
 
 // Events returns the notification stream. The channel is closed when the
@@ -345,8 +437,13 @@ func (c *Client) exitError(scanErr, waitErr error) error {
 // quoteArg wraps an argument for tmux's command-line parser, which splits on
 // spaces and honors single quotes. Simple words pass through untouched so
 // commands stay readable in logs and transcripts.
+//
+// '%' is in the quote set because the control-mode command parser treats a
+// bare leading '%' as its own token type (e.g. %if): an unquoted flow-control
+// target like `refresh-client -A %3:pause` is a parse error, and single
+// quotes are what make it a plain argument.
 func quoteArg(s string) string {
-	if s != "" && !strings.ContainsAny(s, " \t'\"\\;#{}$") {
+	if s != "" && !strings.ContainsAny(s, " \t'\"\\;#{}$%") {
 		return s
 	}
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"

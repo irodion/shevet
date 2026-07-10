@@ -46,7 +46,15 @@ type vtEmulator struct {
 
 // New returns an x/vt-backed Emulator with a w×h screen.
 func New(w, h int) Emulator {
-	e := &vtEmulator{term: vt.NewEmulator(w, h)}
+	term := vt.NewEmulator(w, h)
+	// Disable scrollback (ADR-0008): Shevet never reads the emulator's own
+	// history — Server-side history is its own store — and at x/vt's 10k-line
+	// default every scrolled line paid an O(10k) slice eviction. 1 is the
+	// effective off: x/vt guards SetScrollbackSize(0) as a no-op and does not
+	// expose the screen's SetScrollback(nil), so 1 is the smallest the public
+	// API allows — an O(1) eviction holding a single line.
+	term.SetScrollbackSize(1)
+	e := &vtEmulator{term: term}
 	e.term.SetCallbacks(vt.Callbacks{
 		CursorVisibility: func(visible bool) { e.cursorHidden = !visible },
 	})

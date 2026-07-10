@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/irodion/shevet/internal/herd"
 	"github.com/irodion/shevet/internal/inject"
@@ -33,6 +34,13 @@ type watchedPane struct {
 	// seedBarrier drops output events that predate the pane's latest
 	// capture-pane seed: their bytes are already on the captured screen.
 	seedBarrier uint64
+
+	// paused is set while the pane's output is paused in tmux (ADR-0008),
+	// either because the Server paused a saturated pane or because tmux's
+	// pause-after backstop fired. While paused, live output is dropped — a
+	// scheduled resume re-seeds from the authoritative screen and supersedes
+	// it. Watcher-goroutine state, no lock.
+	paused bool
 }
 
 // paneHub is the single map of live panes, shared between the watcher
@@ -89,6 +97,25 @@ func (h *paneHub) drain() []*watchedPane {
 	return h.sweep(nil)
 }
 
+const (
+	// pauseAfter is the tmux pause-after backstop (ADR-0008): the whole
+	// control stream — not one pane — must fall this far behind before tmux
+	// pauses on its own. The Server pauses individual saturated panes well
+	// before this fires, so it only catches whole-stream overload.
+	pauseAfter = 2 * time.Second
+
+	// resumeDelay throttles a saturated pane's re-seed rate: after pausing,
+	// the Server waits this long before it resumes and re-seeds, so a
+	// sustained flood costs a bounded stream of re-seeds rather than a tight
+	// pause/resume loop that would burn CPU.
+	resumeDelay = 100 * time.Millisecond
+
+	// resumeQueue bounds pending resume signals. At most one is outstanding
+	// per paused pane (a pane stays paused until it resumes), so a whole
+	// Herd's worth of panes never comes close to filling it.
+	resumeQueue = 256
+)
+
 // watcher mirrors one tmux session into the Server: the Registry lists its
 // panes and each pane's output feeds a render pipeline. It is the Server's
 // half of the "tmux owns processes, Shevet owns interpretation" split
@@ -99,6 +126,10 @@ type watcher struct {
 	registry *Registry
 	hub      *paneHub
 	log      *slog.Logger
+
+	// resumeCh carries pane ids whose scheduled resume is due. A timer per
+	// pause feeds it; run drains it and re-seeds the pane (ADR-0008).
+	resumeCh chan string
 }
 
 // attachWatcher attaches to tmux in control mode and performs the initial
@@ -107,7 +138,7 @@ type watcher struct {
 // first reconcile completes before this returns, a Server that serves RPCs
 // only afterwards presents a populated Herd from its very first response.
 func attachWatcher(ctx context.Context, opts TmuxOptions, registry *Registry, hub *paneHub, log *slog.Logger) (*watcher, error) {
-	ctl, err := tmuxctl.Attach(ctx, tmuxctl.Options{Socket: opts.Socket, Session: opts.Session})
+	ctl, err := tmuxctl.Attach(ctx, tmuxctl.Options{Socket: opts.Socket, Session: opts.Session, PauseAfter: pauseAfter})
 	if err != nil {
 		return nil, err
 	}
@@ -117,6 +148,7 @@ func attachWatcher(ctx context.Context, opts TmuxOptions, registry *Registry, hu
 		registry: registry,
 		hub:      hub,
 		log:      log,
+		resumeCh: make(chan string, resumeQueue),
 	}
 	if err := w.reconcile(ctx); err != nil {
 		w.teardown()
@@ -150,6 +182,8 @@ func (w *watcher) run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
+		case paneID := <-w.resumeCh:
+			w.resumePane(ctx, paneID)
 		case ev, ok := <-w.ctl.Events():
 			if !ok {
 				return errors.New("tmux control stream ended")
@@ -161,7 +195,7 @@ func (w *watcher) run(ctx context.Context) error {
 			// Handling output ahead of a pending reconcile is safe: a
 			// pane the reconcile will create gets that output via its
 			// capture-pane seed instead.
-			topology, err := w.apply(ev)
+			topology, err := w.apply(ctx, ev)
 		drain:
 			for err == nil {
 				select {
@@ -170,13 +204,16 @@ func (w *watcher) run(ctx context.Context) error {
 						return errors.New("tmux control stream ended")
 					}
 					var t bool
-					t, err = w.apply(ev)
+					t, err = w.apply(ctx, ev)
 					topology = topology || t
 				default:
 					break drain
 				}
 			}
 			if err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
 				return err
 			}
 			if topology {
@@ -193,18 +230,104 @@ func (w *watcher) run(ctx context.Context) error {
 
 // apply handles one notification, reporting whether it calls for a
 // reconcile. An error means the control client is over.
-func (w *watcher) apply(ev tmuxctl.Event) (topology bool, err error) {
+func (w *watcher) apply(ctx context.Context, ev tmuxctl.Event) (topology bool, err error) {
 	switch ev := ev.(type) {
 	case tmuxctl.OutputEvent:
-		if wp := w.hub.get(ev.PaneID); wp != nil && ev.Seq >= wp.seedBarrier {
-			wp.pipe.output(ev.Data)
+		wp := w.hub.get(ev.PaneID)
+		if wp == nil || ev.Seq < wp.seedBarrier || wp.paused {
+			// Unknown pane, pre-seed bytes, or a paused pane whose output a
+			// pending re-seed will supersede: drop it.
+			return false, nil
 		}
+		if !wp.pipe.output(ev.Data) {
+			// The emulator is behind: pause the pane in tmux so its output
+			// stops accumulating on the Server heap, then schedule a resume
+			// that re-seeds it (ADR-0008).
+			w.pausePane(ctx, ev.PaneID, wp)
+		}
+	case tmuxctl.PauseEvent:
+		// tmux paused a pane: either the echo of the Server's own pause (the
+		// pane is already marked) or the pause-after backstop firing on its
+		// own. Adopt the latter and make sure a resume is scheduled.
+		if wp := w.hub.get(ev.PaneID); wp != nil && !wp.paused {
+			wp.paused = true
+			w.scheduleResume(ev.PaneID)
+		}
+	case tmuxctl.ContinueEvent:
+		// Informational: the Server drives every resume itself.
 	case tmuxctl.TopologyEvent:
 		return true, nil
 	case tmuxctl.ExitEvent:
 		return false, fmt.Errorf("tmux closed the control client %s", strings.TrimSpace(ev.Reason))
 	}
 	return false, nil
+}
+
+// pausePane pauses a saturated pane's output in tmux and schedules its resume.
+// It marks the pane first so the OutputEvents still queued behind this one are
+// dropped instead of racing the pause.
+//
+// Flow-control commands are never fatal to the watcher: a pane can vanish
+// between the output event and the command (a normal topology race), and one
+// pane's failed pause must not tear down the whole session. A pause that fails
+// still schedules a resume — the re-seed recovers the pane whether or not the
+// pause took effect — so the pane can never wedge paused with nothing to
+// unpause it.
+func (w *watcher) pausePane(ctx context.Context, paneID string, wp *watchedPane) {
+	wp.paused = true
+	if _, err := w.ctl.Command(ctx, "refresh-client", "-A", paneID+":pause"); err != nil {
+		if ctx.Err() != nil {
+			return // shutting down
+		}
+		w.log.Warn("pause saturated pane failed", "pane", paneID, "error", err)
+	}
+	w.scheduleResume(paneID)
+}
+
+// scheduleResume asks run to resume paneID after resumeDelay. The send is
+// best-effort: a full resumeCh would only mean a resume is already pending for
+// this pane, which cannot happen (a pane stays paused until it resumes), so in
+// practice it never drops.
+func (w *watcher) scheduleResume(paneID string) {
+	time.AfterFunc(resumeDelay, func() {
+		select {
+		case w.resumeCh <- paneID:
+		default:
+		}
+	})
+}
+
+// resumePane re-seeds a paused pane from its authoritative screen and resumes
+// its output. seed sets the barrier from the capture's stream position, so the
+// output tmux buffered while the pane was paused is dropped and the live
+// stream picks up without duplication — the same degraded reconstruction as a
+// reconnect (ARCHITECTURE.md §5.3).
+//
+// Like pausePane, failures here are recovered rather than fatal: a re-seed or
+// continue that fails reschedules another resume, so a live pane never stays
+// stuck paused.
+func (w *watcher) resumePane(ctx context.Context, paneID string) {
+	wp := w.hub.get(paneID)
+	if wp == nil || !wp.paused {
+		return // pane gone, or already resumed
+	}
+	if err := w.seed(ctx, paneID, wp); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		w.log.Warn("re-seed on resume failed; retrying", "pane", paneID, "error", err)
+		w.scheduleResume(paneID)
+		return
+	}
+	wp.paused = false
+	if _, err := w.ctl.Command(ctx, "refresh-client", "-A", paneID+":continue"); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		w.log.Warn("continue pane failed; retrying", "pane", paneID, "error", err)
+		wp.paused = true
+		w.scheduleResume(paneID)
+	}
 }
 
 // paneInfo is one line of the reconcile snapshot.
@@ -306,7 +429,7 @@ func (w *watcher) seed(ctx context.Context, paneID string, wp *watchedPane) erro
 	fmt.Fprintf(&b, "\x1b[0m\x1b[%d;%dH", cy+1, cx+1)
 
 	wp.seedBarrier = seq
-	wp.pipe.output([]byte(b.String()))
+	wp.pipe.deliverSeed([]byte(b.String()))
 	return nil
 }
 
