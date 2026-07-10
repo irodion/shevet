@@ -299,10 +299,15 @@ func (c *Client) CommandsSeq(ctx context.Context, cmds ...[]string) ([][]string,
 	c.mu.Lock()
 	c.pending = append(c.pending, pend...)
 	_, err := io.WriteString(c.stdin, line)
-	c.mu.Unlock()
 	if err != nil {
+		// The line never reached tmux, so these slots will never be answered.
+		// Drop them under the same lock hold — before any later command's reply
+		// could be routed to a stranded slot — to keep the queue matched.
+		c.pending = c.pending[:len(c.pending)-len(pend)]
+		c.mu.Unlock()
 		return nil, 0, fmt.Errorf("tmuxctl: send commands: %w", err)
 	}
+	c.mu.Unlock()
 
 	replies := make([][]string, len(cmds))
 	var firstSeq uint64
