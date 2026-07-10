@@ -8,7 +8,7 @@ Domain vocabulary lives in `CONTEXT.md`; capitalized terms here (Agent, Host, Pa
 
 ## 1. Scope
 
-One developer. One Client (or several — laptop and tablet concurrently is supported; see the Focus Lease policy in §3.2) attached to Servers on N Hosts the developer owns. No multi-user identity, no tenancy, no shared infrastructure. Hosts must be unix (tmux is load-bearing; WSL counts as linux). The Client builds for any Go target, including Windows.
+One developer. One Client (or several — laptop and tablet concurrently is supported; see the Focus Lease policy in §3.2) attached to Servers on N Hosts the developer owns. No multi-user identity, no tenancy, no shared infrastructure. Hosts must be unix with **tmux ≥ 3.2** (tmux is load-bearing, and its control-mode flow control is the ingest backpressure mechanism — ADR-0008; WSL counts as linux). The Client builds for any Go target, including Windows.
 
 ## 2. Topology
 
@@ -23,7 +23,7 @@ One developer. One Client (or several — laptop and tablet concurrently is supp
 │  · OS notifications     │              │   · Status engine (Signals)          │
 └─────────────────────────┘              │   · hook listener (same socket)      │
                                          │  tmux session "shevet"               │
-                                         │   ├─ window: Server itself           │
+                                         │   ├─ window: Server (tagged)         │
                                          │   ├─ window: Spawned Agent A         │
                                          │   └─ window: Spawned Agent B         │
                                          │  other tmux sessions                 │
@@ -37,11 +37,12 @@ One binary, roles selected at runtime (ADR: runtime flags, never separate builds
 
 ### 3.1 Server
 
-- **Process control: headless tmux (`tmux -C`).** The Server attaches one control-mode client to the tmux server and consumes `%output`, `%pane-*`, `%window-*`, `%exit` notifications. tmux owns PTYs and process persistence; the Server owns interpretation. Kept from the spec unchanged — this is the same mechanism iTerm2's tmux integration uses.
-- **Terminal state: per-Pane pure-Go VT emulator** (ADR-0001). `%output` bytes feed the emulator; it maintains the authoritative cell grid, cursor, and a bounded scrollback (default 10k lines/Pane). Library: **`charmbracelet/x/vt`**, pinned by commit, wrapped behind an internal `Emulator` interface (ADR-0006; bench results in docs/research/vt-emulator-selection.md — it was the only living candidate with correct wide-char/ZWJ grid parity, typed damage tracking, and built-in scrollback).
+- **Process control: headless tmux (`tmux -C`).** The Server attaches a control-mode client to the `shevet` session and consumes `%output` (delivered as `%extended-output`, with an age field, once flow control is on), `%pane-*`, `%window-*`, `%exit` notifications; Adopt attaches additional control clients, one per foreign session containing Adopted Panes (ADR-0009). tmux owns PTYs and process persistence; the Server owns interpretation. Kept from the spec unchanged — this is the same mechanism iTerm2's tmux integration uses.
+  **Backpressure is tmux's job, not a Server-side queue** (ADR-0008): every control client attaches with `pause-after` flow control (hence the tmux ≥ 3.2 floor). A Pane that outruns the Server is paused by tmux (`%pause`) instead of buffered without bound, and resumed (`refresh-client -A`) with a re-seed through the capture-pane path — the same degraded reconstruction as §5.3. The Server's own window is tagged at creation (`@shevet_role=server`) and excluded from the Herd by reconciliation (ADR-0010).
+- **Terminal state: per-Pane pure-Go VT emulator** (ADR-0001). `%output` bytes feed the emulator; it maintains the authoritative cell grid and cursor. The emulator's own scrollback is disabled (ADR-0008): history is a separate Server-side store owned by the scrollback slice, and an in-emulator ring taxes every scrolled line for a buffer nothing reads. Library: **`charmbracelet/x/vt`**, pinned by commit, wrapped behind an internal `Emulator` interface (ADR-0006; bench results in docs/research/vt-emulator-selection.md — it was the only living candidate with correct wide-char/ZWJ grid parity, typed damage tracking, and built-in scrollback).
 - **Damage pipeline** (refined from spec §5.1): the emulator marks dirty cells; a per-Pane coalescer flushes at most every 16ms — *event-driven one-shot timer, not a free-running ticker* — so idle Panes cost zero wakeups. Damage is coalesced per cell (last write wins), making updates idempotent and bounded regardless of Client speed; a Client that falls too far behind receives a full-grid snapshot instead of a queue.
 - **Status engine** (ADR-0004): layered Signals per Agent.
-  1. **Hook Signals** (primary, exact): Shevet installs/documents Claude Code hook configs (`Notification`, `Stop`) whose command pings the Server's unix socket with `{pane, event, reason}`. If the socket is unreachable (Server down), the hook command appends the event to `~/.shevet/signals.spool`; the Server drains the spool on startup, so Signals emitted during Server downtime are delayed rather than lost (ADR-0005).
+  1. **Hook Signals** (primary, exact): Shevet installs/documents Claude Code hook configs (`Notification`, `Stop`) whose command is the shevet binary itself — `shevet signal` with `{pane, event, reason}` — making a unary gRPC call to the `SignalService` on the Server's unix socket (ADR-0011; the listener is gRPC-only, there is no side JSON protocol). If the socket is unreachable (Server down), the CLI appends the event to `~/.shevet/signals.spool`; the Server drains the spool on startup, so Signals emitted during Server downtime are delayed rather than lost (ADR-0005).
      **Spool protocol** (the guarantee is only as strong as this contract):
      - *Framing:* JSONL — one record per line: `{id, pane, event, reason, ts}`. `id` is a ULID minted by the hook command; `ts` is the hook's wall clock.
      - *Concurrent appends:* file opened `O_APPEND|O_CREAT`, one `write(2)` per record, records well under 4 KB — appends from concurrent hooks don't interleave. No fsync: the loss window is a host crash, which kills the Agents themselves anyway.
@@ -51,7 +52,7 @@ One binary, roles selected at runtime (ADR: runtime flags, never separate builds
      - *Idempotent replay:* crash-mid-drain means records can be applied twice, so replay dedupes by `id` (the Server persists the set of applied ids alongside the draining file) and Status transitions are idempotent — re-applying an event to an Agent already in that Status is a no-op.
   2. **Screen Signals** (fallback, generic): output-quiescence timer + prompt patterns evaluated against *rendered rows near the cursor* — never against raw bytes. Per-agent adapter profiles declare which patterns apply.
   - Status enum: `Running`, `Blocked(reason)`, `Idle`, `Exited`. Transitions broadcast on the Telemetry Stream.
-- **Listener:** gRPC on `~/.shevet/shevet.sock` (mode 0600). No TCP listener by default (ADR-0003).
+- **Listener:** gRPC on `~/.shevet/shevet.sock` (mode 0600) — the only protocol on the socket; Hook Signals and the Agent API reach it through the shevet CLI (ADR-0011). No TCP listener by default (ADR-0003).
 
 ### 3.2 Client
 
@@ -65,7 +66,7 @@ One binary, roles selected at runtime (ADR: runtime flags, never separate builds
   - *Mouse:* `send-keys -M` cannot synthesize events (it only forwards a real event from a tmux binding), so the Server **encodes mouse reports itself**: it reads the pane's live mouse-mode formats (`mouse_any_flag`, `mouse_standard_flag`, `mouse_sgr_flag`, `mouse_utf8_flag`, …), emits the matching sequence (SGR `\e[<b;x;yM`, X10, urxvt) as plain ≤0x7F bytes via the paths above — or, when no mouse mode is active, interprets the event Client-side (e.g. wheel = scrollback paging) instead of injecting. Reading the formats at injection time means there is no mouse state to restore after a Server restart.
 - **Focus Lease (multi-Client policy).** A tmux pane has one real size and one input stream, so concurrency is resolved by lease, not by merging: at most one Client holds a Pane's Focus Lease; entering a Pane acquires it, stealing from any current holder (it's the same developer — steal, never block). Only the lease holder's input and `ResizeRequest` are honored; the Pane's canonical size follows the holder, and non-holders render the canonical grid read-only (scrolling their viewport if smaller). Lease changes broadcast on the Telemetry Stream so every Client can show who's driving.
 - **Alerting:** on `Blocked`/`Exited` transitions the attached Client raises an OS notification (OSC 9 / bell / notifier command) in addition to the badge. Detached alerting (webhook/push from the Server) is deferred; the Telemetry Stream already carries the events, so a webhook sink is additive later.
-- **Multi-host:** the Client dials several Hosts concurrently; the Herd view aggregates Agents across connections.
+- **Multi-host:** the Client dials several Hosts concurrently; the Herd view aggregates Agents across connections. Pane identity is Client-scoped by a **PaneRef** — Host alias + Server-scoped pane id — used everywhere the Client names a Pane: selection, focus, leases, input routing, telemetry aggregation. The wire keeps Server-scoped ids: each gRPC connection is exactly one Host, so ids are unambiguous per channel and the protocol needs no host field. Host aliases must be unique within one Client invocation.
 
 ## 4. Protocol
 
@@ -79,13 +80,16 @@ gRPC + Protobuf (kept from spec) over the SSH-tunneled unix socket (ADR-0003). T
 
 Plus unary RPCs: `ListPanes`, `Spawn{host_dir, command}`, `Adopt{tmux_pane_id}`, `Release`, `Kill` (Spawned Agents only — Adopt semantics forbid killing, see CONTEXT.md), `FetchHistory{pane, from, to}`, `ServerInfo` (version handshake).
 
+Hook Signals and the Agent API arrive on the same socket as unary calls to a separate `SignalService`, invoked by the shevet CLI on the Host — never by Clients (ADR-0011).
+
 Versioning: protobuf fields are additive; `ServerInfo` gates incompatible changes and triggers re-bootstrap (§6).
 
 ## 5. Lifecycles
 
 ### 5.1 Agent lifecycle
-- **Spawn:** Client picks Host, working dir, command → Server creates a window in the `shevet` tmux session. Cradle-to-grave ownership, `Kill` allowed.
-- **Adopt:** Server enumerates non-Shevet tmux panes on the Host; the developer adopts one into the Herd. Shevet observes, injects input, and derives Status, but never terminates it; `Release` just stops watching.
+- **Spawn:** Client picks Host, working dir, command → Server creates a window in the `shevet` tmux session. Cradle-to-grave ownership, `Kill` allowed. Provenance is recorded at birth as a pane user option (`@shevet_provenance=spawned`), and Spawn sets `remain-on-exit on` on each window it creates (it is a window/pane option — there is no per-session scope for it): an exited Spawned Pane keeps its final screen inside tmux (Status `Exited`, from `#{pane_dead}`) until explicitly Dismissed — Dismiss is `kill-pane` (ADR-0010).
+- **Adopt:** Server enumerates non-Shevet tmux panes on the Host; the developer adopts one into the Herd. Shevet observes, injects input, and derives Status, but never terminates it; `Release` just stops watching. Observation attaches a control client to the pane's own session — one per foreign session with Adopted Panes, detached on the last Release (ADR-0009). `@shevet_provenance=adopted` is set on the pane and cleared on Release; exited-screen retention is not promised for Adopted Panes (their sessions keep their own `remain-on-exit` configuration).
+- The Server's own tmux window is not an Agent: bootstrap tags it (`@shevet_role=server`) and reconciliation excludes tagged panes from the Herd (ADR-0010).
 
 ### 5.2 Disconnection (network loss — spec §6.1, kept with amendments)
 1. Server drops the dead gRPC stream; tmux and Agents are untouched; Status engine keeps running (Hook Signals keep arriving).
@@ -100,7 +104,8 @@ Recovery is a **degraded reconstruction**, stated honestly:
 - **Restored modes — the explicit acceptance set**, read from tmux's per-pane format variables (tmux tracks these authoritatively even though `capture-pane` doesn't emit them): `alternate_on` (+ `alternate_saved_x/y`), `cursor_x`/`cursor_y`, `cursor_flag` (visibility), `insert_flag` (IRM), `keypad_cursor_flag` (DECCKM application cursor keys), `keypad_flag` (application keypad), `wrap_flag` (DECAWM), `origin_flag` (DECOM).
 - **Modes Shevet deliberately does not restore** because they are read live at injection time, from state tmux never lost (§3.2): bracketed paste (tmux applies it inside `paste-buffer -p`) and all mouse modes (the Server consults the pane's `mouse_*_flag` formats on every mouse event).
 - **Accepted, documented loss:** extended-key/kitty-keyboard negotiation state between the inner application and tmux is not reconstructed into the emulator's view; since keys are injected as raw bytes (`send-keys -H`), the practical effect is limited to rare mis-encoded modifier chords in apps using the kitty protocol, until the app renegotiates.
-- Genuinely lost: in-memory scrollback accumulated before the restart, and any mid-escape-sequence parser state (sub-frame, negligible).
+- Lifecycle metadata reseeds from tmux itself (ADR-0010): the Server window from its `@shevet_role` tag, provenance from `@shevet_provenance` pane options, Exited-but-not-Dismissed Panes from the dead panes `remain-on-exit` kept — final screens included. No separate manifest exists to drift.
+- Genuinely lost: server-side history accumulated before the restart, and any mid-escape-sequence parser state (sub-frame, negligible).
 - Hook Signals emitted during the outage replay from the spool file (per the spool protocol in §3.1, duplicates are deduped by id); Status re-derives from replayed Signals plus the reseeded screen.
 
 ### 5.4 Host reboot
@@ -108,7 +113,7 @@ Opt-in `shevet host enable-boot` installs a systemd user unit / launchd plist th
 
 ## 6. Bootstrap & deployment (ADR-0005)
 
-- `shevet connect <host>`: SSH in → `ServerInfo` probe → if binary missing/stale, upload the correct GOOS/GOARCH artifact (from release download or local artifact cache — the Client cannot copy itself across platforms) → start Server *inside the `shevet` tmux session* under the respawn wrapper (tmux provides persistence; the wrapper provides crash restart — ADR-0005) → tunnel gRPC.
+- `shevet connect <host>`: SSH in → `ServerInfo` probe → if binary missing/stale, upload the correct GOOS/GOARCH artifact (from release download or local artifact cache — the Client cannot copy itself across platforms), verified against the sha256 manifest embedded in the Client at build time; unverified local artifacts require an explicit flag (ADR-0012) → start Server *inside the `shevet` tmux session* under the respawn wrapper, its window tagged `@shevet_role=server` so reconciliation never registers the Server as an Agent (ADR-0010; tmux provides persistence; the wrapper provides crash restart — ADR-0005) → tunnel gRPC.
 - **Tunnel mechanism, concretely:** primary path is the OpenSSH `direct-streamlocal@openssh.com` channel — `golang.org/x/crypto/ssh`'s `Client.Dial("unix", path)` — which forwards straight to the Server's unix socket with no remote helper. Fallback for SSH servers without streamlocal support: `ssh exec` of `shevet _proxy`, a hidden subcommand of the already-present binary that pipes stdio ↔ unix socket. Either way the Host dependency surface stays `tmux` only — no `socat`/`nc` (ADR-0003).
 - Build: `CGO_ENABLED=0` throughout (no Zig, no CGO — ADR-0002); cross-compilation is a plain GOOS/GOARCH matrix. Host dependency surface: `tmux` only.
 - Upgrade: ship a new binary; connect re-bootstraps Servers. Server restarts are non-disruptive to Agents (§5.3).
@@ -127,6 +132,6 @@ Opt-in `shevet host enable-boot` installs a systemd user unit / launchd plist th
 
 - ~~VT emulator library selection spike~~ — resolved: `charmbracelet/x/vt` (ADR-0006, docs/research/vt-emulator-selection.md).
 - Hook installer UX: write into the Host project's `.claude/settings.json` vs user-level config; how to namespace and cleanly uninstall.
-- Artifact distribution channel for bootstrap (GitHub releases URL vs `~/.shevet/artifacts` cache) and checksum verification.
+- ~~Checksum verification for bootstrap artifacts~~ — resolved: sha256 manifest embedded in the Client at build time (ADR-0012). Still open: the distribution channel itself (GitHub releases URL vs `~/.shevet/artifacts` cache priming).
 - Mouse encoding matrix: the design is settled (§3.2 — Server encodes reports per the pane's `mouse_*_flag` formats); remaining work is the full encoder table (X10 vs UTF-8 vs SGR vs urxvt coordinate encodings and their limits, e.g. X10's 223-column cap).
 - Screen Signal profile format (per-agent quiescence thresholds + prompt patterns) and where profiles live.
