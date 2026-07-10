@@ -766,6 +766,85 @@ func TestFocus_RestoreSurvivesQuickRefocus(t *testing.T) {
 	)
 }
 
+func TestFocus_RestoreSurvivesLateEchoAfterViewportChange(t *testing.T) {
+	m, conn := twoPaneModel(t) // pane %1 is 20x5, viewport 120x30
+	m = enterFocus(t, m)
+
+	// The terminal grows mid-focus, then the user unfocuses. The echo of
+	// the *first* focus resize (120x30) arrives only now — it no longer
+	// matches the current viewport (140x40), but it is still our own echo,
+	// not the restore landing: the pending 20x5 must survive it.
+	m = sizeMsg(t, m, 140, 40)
+	m, _ = press(t, m, tea.KeyPressMsg{Code: '\\', Mod: tea.ModCtrl})
+	m = update(t, m, "%1", resize(120, 30))
+
+	m = enterFocus(t, m)
+	_, _ = press(t, m, tea.KeyPressMsg{Code: '\\', Mod: tea.ModCtrl})
+
+	waitResizes(t, conn.sink,
+		resizeCall{pane: "%1", size: grid.Size{W: 120, H: 30}}, // focus
+		resizeCall{pane: "%1", size: grid.Size{W: 140, H: 40}}, // terminal grew
+		resizeCall{pane: "%1", size: grid.Size{W: 20, H: 5}},   // restore
+		resizeCall{pane: "%1", size: grid.Size{W: 140, H: 40}}, // refocus
+		resizeCall{pane: "%1", size: grid.Size{W: 20, H: 5}},   // the true size again
+	)
+}
+
+func TestFocus_ExternalResizeSettlesThePendingRestore(t *testing.T) {
+	m, _ := twoPaneModel(t)
+	m = enterFocus(t, m)
+	m = update(t, m, "%1", resize(120, 30)) // our focus resize echoes back
+	m, _ = press(t, m, tea.KeyPressMsg{Code: '\\', Mod: tea.ModCtrl})
+
+	// While the 20x5 restore is in flight, someone resizes the pane from
+	// the tmux side: the world moved on, so the stale restore target must
+	// be forgotten — the next focus samples the canonical size afresh.
+	m = update(t, m, "%1", resize(66, 22))
+	if _, ok := m.pending[testRef("%1")]; ok {
+		t.Error("an external resize did not settle the pending restore")
+	}
+	m = enterFocus(t, m)
+	if m.restore != (grid.Size{W: 66, H: 22}) {
+		t.Errorf("restore = %v, want the externally set 66x22", m.restore)
+	}
+}
+
+func TestFocus_StalledInputStreamDropsToGridInsteadOfBlocking(t *testing.T) {
+	m, _ := twoPaneModel(t)
+
+	// Enter focus but never start the forwarding Cmd: the stream is
+	// effectively stalled, and every request stays in the buffer.
+	m, _ = press(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
+	if !m.focused() {
+		t.Fatal("enter did not focus")
+	}
+
+	// Fill the queue past its depth. This must never block Update — a
+	// frozen dashboard that cannot even quit is the failure mode — and
+	// once the buffer overflows, the stream is declared stalled: back to
+	// the grid, footer notice, true size kept as pending.
+	for i := 0; i <= forwardBuffer; i++ {
+		m, _ = press(t, m, tea.KeyPressMsg{Code: 'x', Text: "x"})
+	}
+	if m.focused() {
+		t.Error("still in passthrough after the input queue overflowed")
+	}
+	if m.inputErrs[testAlias] == nil {
+		t.Error("the stalled stream was not surfaced")
+	}
+	if got := m.pending[testRef("%1")]; got != (grid.Size{W: 20, H: 5}) {
+		t.Errorf("pending restore = %v, want the pre-focus 20x5", got)
+	}
+	// The dashboard is alive: q still quits.
+	_, cmd := press(t, m, tea.KeyPressMsg{Code: 'q', Text: "q"})
+	if cmd == nil {
+		t.Fatal("'q' produced no command after the stall")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Fatal("'q' does not quit after the stall")
+	}
+}
+
 func TestNewServers_RejectsDuplicateAliases(t *testing.T) {
 	_, err := NewServers([]Server{
 		{Alias: "prod", Conn: &fakeConn{}},

@@ -16,6 +16,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -163,9 +164,18 @@ type Model struct {
 	// reads the viewport size until the restore round-trips through tmux,
 	// so sampling it again would adopt the viewport as the size to restore
 	// to — and the Pane's true size would be lost for good.
+	//
+	// imposed tracks, per Pane, the focus resizes this Client has sent
+	// whose confirming PaneResized has not yet arrived (a multiset: the
+	// same size can be in flight twice across a refocus). It is how a late
+	// echo of our own resize — which can differ from the current viewport
+	// if the terminal changed mid-focus — is told apart from the restore
+	// landing or a genuinely external resize: only the latter two settle a
+	// pending restore.
 	focus   herd.PaneRef
 	restore grid.Size
 	pending map[herd.PaneRef]grid.Size
+	imposed map[herd.PaneRef][]grid.Size
 
 	// Input plumbing: one forwarding channel per Host, opened lazily on the
 	// first focus of one of its Panes and drained onto that Host's Control
@@ -194,6 +204,7 @@ func New(ctx context.Context, servers []Server) Model {
 		ctx:       ctx,
 		views:     make(map[herd.PaneRef]*paneState),
 		pending:   make(map[herd.PaneRef]grid.Size),
+		imposed:   make(map[herd.PaneRef][]grid.Size),
 		inputs:    make(map[string]chan inputReq),
 		inputErrs: make(map[string]error),
 	}
@@ -344,12 +355,17 @@ func forwardInputCmd(ctx context.Context, conn Conn, host string, ch <-chan inpu
 	}
 }
 
-// send hands one request to a forwarding Cmd, giving up only if the program
-// is shutting down (so a stalled socket cannot wedge the UI).
-func send(ctx context.Context, ch chan<- inputReq, req inputReq) {
+// send hands one request to a forwarding Cmd without ever blocking the UI
+// goroutine, reporting whether it was queued. A full buffer means the
+// forwarding Cmd has not drained hundreds of requests — the Host's input
+// stream has stalled — and blocking on it would freeze the whole dashboard
+// (no keys, not even quit). The caller declares the stream stalled instead.
+func send(ch chan<- inputReq, req inputReq) bool {
 	select {
 	case ch <- req:
-	case <-ctx.Done():
+		return true
+	default:
+		return false
 	}
 }
 
@@ -360,8 +376,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		if m.focused() {
-			// The viewport is the focused Pane's size; track it.
-			m.queueResize(m.focus, grid.Size{W: m.width, H: m.height})
+			// The viewport is the focused Pane's size; track it. queueResize
+			// can drop focus (a stalled stream), so only a resize that was
+			// actually queued is recorded as in flight.
+			size := grid.Size{W: m.width, H: m.height}
+			ref := m.focus
+			m.queueResize(ref, size)
+			if m.focused() {
+				m.impose(ref, size)
+			}
 		}
 
 	case tea.KeyPressMsg:
@@ -398,16 +421,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		st.view.Apply(msg.update)
-		if r := msg.update.Resized; r != nil && m.focus != msg.ref {
-			// A resize landed while we are not driving the Pane. If it is
-			// the viewport size we imposed, it is only the focus resize
-			// echoing back late — the pending restore is still the truth.
-			// Anything else means the restore (or an external resize
-			// superseding it) applied: the canonical size is trustworthy
-			// again, so the pending entry has served its purpose.
-			if *r != (grid.Size{W: m.width, H: m.height}) {
-				delete(m.pending, msg.ref)
-			}
+		if r := msg.update.Resized; r != nil && !m.consumeImposed(msg.ref, *r) && m.focus != msg.ref {
+			// Not one of our own focus resizes echoing back, and we are not
+			// driving the Pane: this is the pending restore landing, or an
+			// external resize superseding it. Either way the canonical size
+			// is trustworthy again, so the bookkeeping has served its
+			// purpose.
+			delete(m.pending, msg.ref)
+			delete(m.imposed, msg.ref)
 		}
 		if st.view.Exited {
 			if m.focus == msg.ref {
@@ -416,6 +437,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.focus = herd.PaneRef{}
 			}
 			delete(m.pending, msg.ref)
+			delete(m.imposed, msg.ref)
 			return m, nil // stream is over; the Server sends nothing after exited
 		}
 		return m, recvCmd(msg.ref, msg.stream)
@@ -436,17 +458,45 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case inputFailedMsg:
 		// This Host's passthrough is unavailable; drop back to the grid but
 		// keep rendering. Focusing again retries with a fresh stream.
-		m.inputErrs[msg.host] = msg.err
-		delete(m.inputs, msg.host)
-		if m.focus.Host == msg.host {
-			// The restore cannot be sent — the stream died with it — but
-			// recording it as pending means the next focus/unfocus cycle
-			// still restores the true pre-focus size.
-			m.pending[m.focus] = m.restore
-			m.focus = herd.PaneRef{}
-		}
+		m.dropInput(msg.host, msg.err)
 	}
 	return m, nil
+}
+
+// dropInput declares a Host's input stream unusable — it failed, or its
+// queue overflowed because nothing was draining it — and drops back to the
+// grid if its Pane was focused. The channel is discarded so the next focus
+// opens a fresh stream; the restore that can no longer be sent is recorded
+// as pending, so the next focus/unfocus cycle still restores the true
+// pre-focus size.
+func (m *Model) dropInput(host string, err error) {
+	m.inputErrs[host] = err
+	delete(m.inputs, host)
+	if m.focus.Host == host {
+		m.pending[m.focus] = m.restore
+		m.focus = herd.PaneRef{}
+	}
+}
+
+// impose records a focus resize as in flight, until its PaneResized echoes
+// back.
+func (m *Model) impose(ref herd.PaneRef, size grid.Size) {
+	m.imposed[ref] = append(m.imposed[ref], size)
+}
+
+// consumeImposed removes one in-flight focus resize matching an arriving
+// PaneResized, reporting whether the resize was our own echo.
+func (m *Model) consumeImposed(ref herd.PaneRef, size grid.Size) bool {
+	for i, s := range m.imposed[ref] {
+		if s == size {
+			m.imposed[ref] = append(m.imposed[ref][:i], m.imposed[ref][i+1:]...)
+			if len(m.imposed[ref]) == 0 {
+				delete(m.imposed, ref)
+			}
+			return true
+		}
+	}
+	return false
 }
 
 // unfocus returns to the grid, sending the focused Pane its pre-focus size
@@ -493,6 +543,7 @@ func (m Model) applyHerd(panes []refPane) (tea.Model, tea.Cmd) {
 		if !live[ref] {
 			delete(m.views, ref)
 			delete(m.pending, ref)
+			delete(m.imposed, ref)
 		}
 	}
 	if m.focused() && !live[m.focus] {
@@ -513,7 +564,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		if data := encodeKey(msg); len(data) > 0 {
 			if ch := m.inputs[m.focus.Host]; ch != nil {
-				send(m.ctx, ch, inputReq{paneID: m.focus.ID, keys: data})
+				if !send(ch, inputReq{paneID: m.focus.ID, keys: data}) {
+					m.dropInput(m.focus.Host, errStalledInput)
+				}
 			}
 		}
 		return m, nil
@@ -593,17 +646,31 @@ func (m Model) focusSelected() (Model, tea.Cmd) {
 		m.inputs[ref.Host] = ch
 		cmd = forwardInputCmd(m.ctx, m.conns[ref.Host], ref.Host, ch)
 	}
-	send(m.ctx, ch, inputReq{paneID: ref.ID, resize: &grid.Size{W: m.width, H: m.height}})
+	viewport := grid.Size{W: m.width, H: m.height}
+	if !send(ch, inputReq{paneID: ref.ID, resize: &viewport}) {
+		// A reused channel can be full (a stalled stream); a focus that
+		// cannot even ask for its size does not happen.
+		m.dropInput(ref.Host, errStalledInput)
+		return m, cmd
+	}
+	m.impose(ref, viewport)
 	return m, cmd
 }
+
+// errStalledInput reports an input queue that overflowed: the forwarding
+// Cmd stopped draining it, which means the Control Input stream is wedged.
+var errStalledInput = errors.New("input stream stalled; focus a Pane to reconnect")
 
 // queueResize hands a resize request for ref to its Host's forwarding Cmd,
 // if that Host's input stream is up (it always is on the focus/unfocus
 // paths, which open it; after an input failure the restore is skipped —
-// there is no stream left to carry it).
+// there is no stream left to carry it). A stalled stream is dropped rather
+// than blocked on.
 func (m *Model) queueResize(ref herd.PaneRef, size grid.Size) {
 	if ch := m.inputs[ref.Host]; ch != nil {
-		send(m.ctx, ch, inputReq{paneID: ref.ID, resize: &size})
+		if !send(ch, inputReq{paneID: ref.ID, resize: &size}) {
+			m.dropInput(ref.Host, errStalledInput)
+		}
 	}
 }
 
