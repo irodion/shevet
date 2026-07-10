@@ -11,4 +11,4 @@ Rejected: no verification / trust-on-first-use (a silently corrupted or tampered
 ## Consequences
 
 - The release process must produce the manifest before (or while) building the Client, making artifact hashing part of the build graph.
-- A Client can only bootstrap Servers of its own release; that is already the upgrade model (connect re-bootstraps to the Client's version).
+- A *verified* bootstrap can only install Servers of the Client's own release; that is already the upgrade model (connect re-bootstraps to the Client's version). The explicit-flag path is exactly the release from this rule, for local and unreleased artifacts.
