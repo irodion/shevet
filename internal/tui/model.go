@@ -449,6 +449,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// external resize superseding it. Either way the canonical size
 			// is trustworthy again, so the bookkeeping has served its
 			// purpose.
+			//
+			// Echoes are matched by size, not by a request id, and that is
+			// deliberate: the watcher coalesces notification bursts into
+			// one reconcile, so an intermediate resize's confirmation may
+			// never be emitted at all — correlation by id would strand the
+			// bookkeeping on acks that legitimately never come. The price
+			// is a narrow ambiguity: an external resize that exactly equals
+			// an in-flight focus size, landing while unfocused and followed
+			// by a refocus before the restore settles, is mistaken for our
+			// echo, and the next unfocus restores the pre-focus size over
+			// it — a wrong-size Pane the next resize corrects, not a wedge.
+			// The real fix is the Focus Lease slice (#14): the Server
+			// records the pre-focus size at lease acquire and restores it
+			// at release, deleting this client-side bookkeeping entirely.
 			delete(m.pending, msg.ref)
 			delete(m.imposed, msg.ref)
 		}
