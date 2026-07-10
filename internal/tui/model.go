@@ -177,12 +177,12 @@ type Model struct {
 	pending map[herd.PaneRef]grid.Size
 	imposed map[herd.PaneRef][]grid.Size
 
-	// Input plumbing: one forwarding channel per Host, opened lazily on the
-	// first focus of one of its Panes and drained onto that Host's Control
-	// Input stream by a forwarding Cmd. inputErrs records, per Host, a
-	// stream that could not open or broke; focusing a Pane on that Host
-	// again retries.
-	inputs    map[string]chan inputReq
+	// Input plumbing: one generation of forwarding plumbing per Host (see
+	// inputConn), opened lazily on the first focus of one of its Panes and
+	// drained onto that Host's Control Input stream by a forwarding Cmd.
+	// inputErrs records, per Host, a stream that could not open or broke;
+	// focusing a Pane on that Host again retries with a new generation.
+	inputs    map[string]*inputConn
 	inputErrs map[string]error
 }
 
@@ -205,7 +205,7 @@ func New(ctx context.Context, servers []Server) Model {
 		views:     make(map[herd.PaneRef]*paneState),
 		pending:   make(map[herd.PaneRef]grid.Size),
 		imposed:   make(map[herd.PaneRef][]grid.Size),
-		inputs:    make(map[string]chan inputReq),
+		inputs:    make(map[string]*inputConn),
 		inputErrs: make(map[string]error),
 	}
 }
@@ -244,9 +244,12 @@ type watchFailedMsg struct {
 }
 
 // inputFailedMsg reports that a Host's Control Input stream could not open
-// or broke. Rendering is unaffected; focusing retries.
+// or broke. It names the generation that failed: a retired generation's
+// death rattle must not tear down its healthy replacement. Rendering is
+// unaffected; focusing retries.
 type inputFailedMsg struct {
 	host string
+	gen  *inputConn
 	err  error
 }
 
@@ -316,6 +319,17 @@ type inputReq struct {
 	resize *grid.Size
 }
 
+// inputConn is one generation of a Host's input plumbing: the request queue
+// its forwarding Cmd drains, and the cancel that retires the generation.
+// Retiring cancels the generation's context — which its Control Input
+// stream was opened under — so a wedged send is aborted rather than left
+// to drain a stale backlog into a Pane later, and any failure it reports
+// afterwards identifies itself and is ignored.
+type inputConn struct {
+	ch     chan inputReq
+	cancel context.CancelFunc
+}
+
 // forwardBuffer is the depth of the request queue between the UI goroutine
 // and a Host's forwarding Cmd. It only fills if the socket stalls faster
 // than a human types — orders of magnitude more headroom than real typing
@@ -323,22 +337,30 @@ type inputReq struct {
 // opening.
 const forwardBuffer = 256
 
-// forwardInputCmd opens one Host's Control Input stream and then drains
-// requests from ch onto it, in order, on this one Cmd's goroutine — so a
-// gRPC client stream (not safe for concurrent use) has a single owner, and
-// the UI goroutine never blocks on the socket. It returns inputFailedMsg if
-// the stream cannot open or a send fails, and nothing when the program ends.
-func forwardInputCmd(ctx context.Context, conn Conn, host string, ch <-chan inputReq) tea.Cmd {
+// forwardInputCmd opens one Host's Control Input stream under the
+// generation's context and then drains requests from its queue onto it, in
+// order, on this one Cmd's goroutine — so a gRPC client stream (not safe
+// for concurrent use) has a single owner, and the UI goroutine never blocks
+// on the socket. It returns inputFailedMsg (tagged with its generation) if
+// the stream cannot open or a send fails, and nothing when the generation
+// is retired or the program ends.
+func forwardInputCmd(ctx context.Context, conn Conn, host string, gen *inputConn) tea.Cmd {
 	return func() tea.Msg {
 		sink, err := conn.SendInput(ctx)
 		if err != nil {
-			return inputFailedMsg{host: host, err: err}
+			return inputFailedMsg{host: host, gen: gen, err: err}
 		}
 		for {
 			select {
 			case <-ctx.Done():
 				return nil
-			case req := <-ch:
+			case req := <-gen.ch:
+				if ctx.Err() != nil {
+					// Retired while requests were still queued: the backlog
+					// is stale input for a driver that gave up on us — it
+					// must never replay into the Pane.
+					return nil
+				}
 				// The PaneRef routed us to this Host's connection; the wire
 				// carries the bare Server-scoped id.
 				var err error
@@ -348,7 +370,7 @@ func forwardInputCmd(ctx context.Context, conn Conn, host string, ch <-chan inpu
 					err = sink.SendKeys(req.paneID, req.keys)
 				}
 				if err != nil {
-					return inputFailedMsg{host: host, err: err}
+					return inputFailedMsg{host: host, gen: gen, err: err}
 				}
 			}
 		}
@@ -456,22 +478,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case inputFailedMsg:
+		if m.inputs[msg.host] != msg.gen {
+			// A retired generation reporting its own death (the cancel
+			// aborted its stream, or it was already superseded): history,
+			// not news — the live generation must not be torn down for it.
+			return m, nil
+		}
 		// This Host's passthrough is unavailable; drop back to the grid but
-		// keep rendering. Focusing again retries with a fresh stream.
+		// keep rendering. Focusing again retries with a fresh generation.
 		m.dropInput(msg.host, msg.err)
 	}
 	return m, nil
 }
 
-// dropInput declares a Host's input stream unusable — it failed, or its
+// dropInput retires a Host's input generation — its stream failed, or its
 // queue overflowed because nothing was draining it — and drops back to the
-// grid if its Pane was focused. The channel is discarded so the next focus
-// opens a fresh stream; the restore that can no longer be sent is recorded
-// as pending, so the next focus/unfocus cycle still restores the true
-// pre-focus size.
+// grid if its Pane was focused. The cancel aborts the generation's stream,
+// so a wedged send can neither replay its backlog later nor outlive its
+// replacement; the next focus opens a fresh generation. The restore that
+// can no longer be sent is recorded as pending, so the next focus/unfocus
+// cycle still restores the true pre-focus size.
 func (m *Model) dropInput(host string, err error) {
 	m.inputErrs[host] = err
-	delete(m.inputs, host)
+	if gen := m.inputs[host]; gen != nil {
+		gen.cancel()
+		delete(m.inputs, host)
+	}
 	if m.focus.Host == host {
 		m.pending[m.focus] = m.restore
 		m.focus = herd.PaneRef{}
@@ -563,8 +595,8 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if data := encodeKey(msg); len(data) > 0 {
-			if ch := m.inputs[m.focus.Host]; ch != nil {
-				if !send(ch, inputReq{paneID: m.focus.ID, keys: data}) {
+			if gen := m.inputs[m.focus.Host]; gen != nil {
+				if !send(gen.ch, inputReq{paneID: m.focus.ID, keys: data}) {
 					m.dropInput(m.focus.Host, errStalledInput)
 				}
 			}
@@ -635,20 +667,21 @@ func (m Model) focusSelected() (Model, tea.Cmd) {
 		m.restore = grid.Size{W: w, H: h}
 	}
 
-	// Open this Host's input stream when there isn't a live one — including
-	// a retry after a prior failure. Requests issued before the stream opens
-	// wait in the buffer.
+	// Open this Host's input generation when there isn't a live one —
+	// including a retry after a prior failure. Requests issued before the
+	// stream opens wait in the buffer.
 	var cmd tea.Cmd
-	ch := m.inputs[ref.Host]
-	if ch == nil {
+	gen := m.inputs[ref.Host]
+	if gen == nil {
 		delete(m.inputErrs, ref.Host)
-		ch = make(chan inputReq, forwardBuffer)
-		m.inputs[ref.Host] = ch
-		cmd = forwardInputCmd(m.ctx, m.conns[ref.Host], ref.Host, ch)
+		genCtx, cancel := context.WithCancel(m.ctx)
+		gen = &inputConn{ch: make(chan inputReq, forwardBuffer), cancel: cancel}
+		m.inputs[ref.Host] = gen
+		cmd = forwardInputCmd(genCtx, m.conns[ref.Host], ref.Host, gen)
 	}
 	viewport := grid.Size{W: m.width, H: m.height}
-	if !send(ch, inputReq{paneID: ref.ID, resize: &viewport}) {
-		// A reused channel can be full (a stalled stream); a focus that
+	if !send(gen.ch, inputReq{paneID: ref.ID, resize: &viewport}) {
+		// A reused queue can be full (a stalled stream); a focus that
 		// cannot even ask for its size does not happen.
 		m.dropInput(ref.Host, errStalledInput)
 		return m, cmd
@@ -667,8 +700,8 @@ var errStalledInput = errors.New("input stream stalled; focus a Pane to reconnec
 // there is no stream left to carry it). A stalled stream is dropped rather
 // than blocked on.
 func (m *Model) queueResize(ref herd.PaneRef, size grid.Size) {
-	if ch := m.inputs[ref.Host]; ch != nil {
-		if !send(ch, inputReq{paneID: ref.ID, resize: &size}) {
+	if gen := m.inputs[ref.Host]; gen != nil {
+		if !send(gen.ch, inputReq{paneID: ref.ID, resize: &size}) {
 			m.dropInput(ref.Host, errStalledInput)
 		}
 	}

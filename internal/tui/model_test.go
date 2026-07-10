@@ -557,8 +557,8 @@ func TestFocus_QueuesRequestsUntilStreamOpens(t *testing.T) {
 
 	// The focus resize plus a keystroke wait in the buffer, not lost.
 	m, _ = press(t, m, tea.KeyPressMsg{Code: 'x', Text: "x"})
-	if len(m.inputs[testAlias]) != 2 {
-		t.Fatalf("buffered %d requests, want 2 held before the stream opened", len(m.inputs[testAlias]))
+	if len(m.inputs[testAlias].ch) != 2 {
+		t.Fatalf("buffered %d requests, want 2 held before the stream opened", len(m.inputs[testAlias].ch))
 	}
 
 	// Once the forwarder runs, it opens the stream and drains the buffer.
@@ -842,6 +842,55 @@ func TestFocus_StalledInputStreamDropsToGridInsteadOfBlocking(t *testing.T) {
 	}
 	if _, ok := cmd().(tea.QuitMsg); !ok {
 		t.Fatal("'q' does not quit after the stall")
+	}
+}
+
+func TestFocus_RetiredGenerationCannotHauntItsReplacement(t *testing.T) {
+	m, conn := twoPaneModel(t)
+
+	// Generation 1: focus, hold its forwarder unstarted, and wedge it —
+	// fill the queue until the stream is declared stalled and retired.
+	m, gen1Cmd := press(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
+	if gen1Cmd == nil {
+		t.Fatal("focus did not open an input generation")
+	}
+	gen1 := m.inputs[testAlias]
+	for i := 0; i <= forwardBuffer; i++ {
+		m, _ = press(t, m, tea.KeyPressMsg{Code: 'x', Text: "x"})
+	}
+	if m.focused() || m.inputs[testAlias] != nil {
+		t.Fatal("overflow did not retire the generation")
+	}
+
+	// Generation 2: refocusing opens fresh plumbing.
+	m = enterFocus(t, m)
+	gen2 := m.inputs[testAlias]
+	if gen2 == nil || gen2 == gen1 {
+		t.Fatal("refocus did not open a fresh generation")
+	}
+
+	// The retired forwarder finally runs. Its context was canceled when it
+	// was retired, so the hundreds of queued keystrokes must never replay
+	// into the Pane — only generation 2's focus resize reaches the wire.
+	if msg := gen1Cmd(); msg != nil {
+		m, _ = feed(t, m, msg)
+	}
+	waitResizes(t, conn.sink, resizeCall{pane: "%1", size: grid.Size{W: 120, H: 30}})
+	if got := string(conn.sink.received()); strings.Contains(got, "x") {
+		t.Errorf("a retired generation replayed stale input: %q", got)
+	}
+
+	// And its death rattle is ignored: a stale failure must not tear down
+	// the live generation.
+	m, _ = feed(t, m, inputFailedMsg{host: testAlias, gen: gen1, err: errors.New("late failure")})
+	if !m.focused() {
+		t.Error("a stale input failure unfocused the live session")
+	}
+	if m.inputs[testAlias] != gen2 {
+		t.Error("a stale input failure tore down the live generation")
+	}
+	if m.inputErrs[testAlias] != nil {
+		t.Errorf("a stale input failure was recorded: %v", m.inputErrs[testAlias])
 	}
 }
 
