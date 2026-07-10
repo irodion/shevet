@@ -16,3 +16,27 @@ type Pane struct {
 	// Title is a human-readable label for dashboards.
 	Title string
 }
+
+// PaneRef is the Client-scoped identity of a Pane: a Host alias plus the
+// Server-scoped pane id. A tmux pane id (%0, %1) is only unique within one
+// Host, so the same id recurs across Hosts; the Client therefore names every
+// Pane by a PaneRef — for selection, focus, input routing, and telemetry
+// aggregation — never by a bare pane id (ARCHITECTURE §3.2).
+//
+// A PaneRef is assembled Client-side and never crosses the wire: each gRPC
+// connection is exactly one Host, so Server-scoped ids stay unambiguous per
+// channel and Pane messages carry no host field. Host aliases are unique
+// within one Client invocation, which makes a PaneRef unique across the Herd.
+type PaneRef struct {
+	// Host is the alias of the Host whose Server owns the Pane.
+	Host string
+
+	// ID is the Server-scoped pane id (tmux's %N), unique per Host.
+	ID string
+}
+
+// String renders the PaneRef as "host:%id" — its stable form for map keys,
+// logs, and diagnostics.
+func (r PaneRef) String() string {
+	return r.Host + ":" + r.ID
+}
