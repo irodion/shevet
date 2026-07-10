@@ -94,13 +94,13 @@ func TestConnect_RequiresTarget(t *testing.T) {
 	}
 }
 
-func TestConnect_HostNotImplementedYet(t *testing.T) {
-	code, _, stderr := run(t, "connect", "somehost")
-	if code != exitError {
-		t.Errorf("exit code = %d, want %d", code, exitError)
+func TestConnect_RemoteSocketRequiresHost(t *testing.T) {
+	code, _, stderr := run(t, "connect", "-socket", "/tmp/x.sock", "-remote-socket", "/r.sock")
+	if code != exitUsage {
+		t.Errorf("exit code = %d, want %d", code, exitUsage)
 	}
-	if !strings.Contains(stderr, "not implemented") {
-		t.Errorf("stderr does not explain the missing SSH transport:\n%s", stderr)
+	if !strings.Contains(stderr, "remote-socket") {
+		t.Errorf("stderr does not explain --remote-socket needs a host:\n%s", stderr)
 	}
 }
 
@@ -124,12 +124,24 @@ func TestServe_RejectsPositionalArgs(t *testing.T) {
 	}
 }
 
-func TestProxy_NotImplemented(t *testing.T) {
-	code, _, stderr := run(t, "_proxy")
+func TestProxy_MissingSocketIsActionable(t *testing.T) {
+	// Pumping to a socket that isn't there fails with a message that names
+	// the likely cause — the Client relays this over SSH.
+	code, _, stderr := run(t, "_proxy", "/nonexistent/shevet/absent.sock")
 	if code != exitError {
 		t.Errorf("exit code = %d, want %d", code, exitError)
 	}
-	if !strings.Contains(stderr, "not implemented") {
-		t.Errorf("stderr does not explain the stub:\n%s", stderr)
+	if !strings.Contains(stderr, "Server running") {
+		t.Errorf("stderr does not explain the missing Server:\n%s", stderr)
+	}
+}
+
+func TestProxy_TooManyArgs(t *testing.T) {
+	code, _, stderr := run(t, "_proxy", "/a.sock", "/b.sock")
+	if code != exitUsage {
+		t.Errorf("exit code = %d, want %d", code, exitUsage)
+	}
+	if !strings.Contains(stderr, "at most one") {
+		t.Errorf("stderr does not flag the extra argument:\n%s", stderr)
 	}
 }
