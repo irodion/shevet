@@ -278,6 +278,11 @@ func (c *Client) CommandSeq(ctx context.Context, args ...string) ([]string, uint
 // commands stay matched. Both this and the no-interleave guarantee are
 // long-standing tmux command-queue behaviors, relied on across the ≥ 3.2 floor
 // (ADR-0008) and verified on 3.7b.
+//
+// This abort-on-error accounting is what keeps the reply stream matched, so
+// every command passed here must be one tmux aborts the sequence on when it
+// fails — capture-pane, display-message and the like all do. Do not pass a
+// command that can report an error yet let the sequence continue.
 func (c *Client) CommandsSeq(ctx context.Context, cmds ...[]string) ([][]string, uint64, error) {
 	if len(cmds) == 0 {
 		return nil, 0, nil

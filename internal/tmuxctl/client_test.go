@@ -163,10 +163,38 @@ func TestCommandsSeq_ErrorKeepsRepliesMatched(t *testing.T) {
 // flood, two #{history_size} reads in one CommandsSeq must be equal — no
 // %output landed between them — even as the size climbs across iterations.
 // Separately-sent commands would disagree, which is the seed skew this fixes.
+//
+// It runs both without flow control (plain %output) and with pause-after (the
+// %extended-output form the real Server attaches with), since the seed runs
+// under flow control and the atomicity must hold for that output form too.
 func TestCommandsSeq_AtomicSnapshotUnderFlood(t *testing.T) {
 	t.Parallel()
-	tm := tmuxtest.Start(t)
-	c := attach(t, tm)
+	for _, tc := range []struct {
+		name       string
+		pauseAfter time.Duration
+	}{
+		{"plain output", 0},
+		{"flow control", 2 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tm := tmuxtest.Start(t)
+			c, err := tmuxctl.Attach(context.Background(), tmuxctl.Options{
+				Socket:     tm.Socket(),
+				Session:    "holder",
+				PauseAfter: tc.pauseAfter,
+			})
+			if err != nil {
+				t.Fatalf("Attach: %v", err)
+			}
+			t.Cleanup(func() { c.Close() }) //nolint:errcheck // best-effort teardown
+			assertAtomicSnapshotUnderFlood(t, tm, c)
+		})
+	}
+}
+
+func assertAtomicSnapshotUnderFlood(t *testing.T, tm *tmuxtest.Tmux, c *tmuxctl.Client) {
+	t.Helper()
 
 	// A never-ending flood keeps output in flight for every iteration; drain
 	// the notification stream so the queue stays bounded while we probe.
