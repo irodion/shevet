@@ -56,10 +56,12 @@ type subscriber struct {
 // burst fits without a spurious pause, small enough to bound per-pane memory.
 const opsQueue = 64
 
-// maxRetainedBatch caps the coalescing buffer an idle pane keeps between
-// wakeups. A normal wakeup's output fits well under this, so the buffer is
-// reused; a flood that coalesces far more is written and then released rather
-// than pinned at the high-water mark for the pane's lifetime (ADR-0008).
+// maxRetainedBatch bounds the coalescing buffer a pane keeps once its output
+// subsides. A wakeup that coalesces more than this keeps reusing its buffer, so
+// steady bulk output (which can exceed it — one tmux %output decodes to well
+// over 64 KiB) never re-allocates; once a later, smaller wakeup no longer needs
+// the grown capacity, the buffer is released rather than pinned at the flood's
+// high-water mark for the pane's lifetime (ADR-0008).
 const maxRetainedBatch = 64 * 1024
 
 // pipeline is the per-Pane render pipeline: it owns the Pane's emulator
@@ -248,11 +250,13 @@ func (p *pipeline) run(w, h int, newEmu func(w, h int) emu.Emulator) {
 			return
 		}
 		term.Write(outBatch) //nolint:errcheck // the emulator consumes everything
-		// Reuse the buffer across wakeups so a busy pane doesn't re-allocate
-		// each flush, but release a one-off flood's peak instead of pinning it
-		// for the pane's lifetime — the branch's memory stays bounded when the
-		// pane goes idle (ADR-0008), not stuck at the high-water mark.
-		if cap(outBatch) > maxRetainedBatch {
+		// Keep reusing the buffer while wakeups still fill it — a busy or
+		// bulk-streaming pane never re-allocates. Release it only once an
+		// oversized buffer outgrows what a wakeup needs (the flood that grew it
+		// has passed), so a pane that falls quiet doesn't pin the flood's peak
+		// for its lifetime (ADR-0008). This is subscriber-independent, so an
+		// unwatched pane is bounded too.
+		if cap(outBatch) > maxRetainedBatch && len(outBatch) <= maxRetainedBatch {
 			outBatch = nil
 		} else {
 			outBatch = outBatch[:0]
