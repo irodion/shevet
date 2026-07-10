@@ -276,19 +276,19 @@ func (p *pipeline) run(w, h int, newEmu func(w, h int) emu.Emulator) {
 			continue
 		}
 
-		// Gather every op already queued for this wakeup in arrival order,
-		// then apply it with consecutive output coalesced. Draining the
-		// channel this way also keeps it short, so output()'s full-queue
-		// check tracks the emulator falling behind rather than scheduling.
+		// Gather the ops already queued at this wakeup — a snapshot of the
+		// channel, not a drain-until-empty. Each receive frees a slot the
+		// watcher can immediately refill, so a continuous producer could keep a
+		// drain-until-empty loop receiving without bound: burst and outBatch
+		// would grow past the queue size, term.Write would be deferred, and
+		// output()'s full-queue pause would never trip (ADR-0008). Snapshotting
+		// bounds the batch to at most opsQueue, so every wakeup makes progress
+		// and coalesces; ops that arrive during the batch wait for the next one,
+		// which keeps the channel short so its full-queue check tracks the
+		// emulator falling behind, not scheduling.
 		burst = append(burst[:0], op)
-	gather:
-		for {
-			select {
-			case more := <-p.ops:
-				burst = append(burst, more)
-			default:
-				break gather
-			}
+		for queued := len(p.ops); queued > 0; queued-- {
+			burst = append(burst, <-p.ops)
 		}
 
 		for _, op := range burst {
