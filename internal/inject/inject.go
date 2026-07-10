@@ -24,6 +24,7 @@ package inject
 import (
 	"context"
 	"fmt"
+	"strconv"
 )
 
 // Commander runs one tmux command and returns its reply. *tmuxctl.Client
@@ -60,6 +61,22 @@ func Keys(ctx context.Context, ctl Commander, paneID string, data []byte) error 
 			return err
 		}
 		i = j
+	}
+	return nil
+}
+
+// Resize resizes the tmux window holding paneID to w×h cells, realizing a
+// Client's ResizeRequest (resize-on-focus, ARCHITECTURE.md §3.2). tmux sizes
+// windows, not panes, and every Pane in the Herd occupies its window alone
+// (Spawn creates one window per Agent), so resizing the window is resizing
+// the Pane. tmux switches the window to manual sizing, reflows, and reports
+// the new geometry through its usual notifications — the watcher's reconcile
+// picks the change up from there, so confirmation rides the render stream
+// (PaneResized), never this call.
+func Resize(ctx context.Context, ctl Commander, paneID string, w, h int) error {
+	if _, err := ctl.Command(ctx, "resize-window", "-t", paneID,
+		"-x", strconv.Itoa(w), "-y", strconv.Itoa(h)); err != nil {
+		return fmt.Errorf("resize pane %s to %dx%d: %w", paneID, w, h, err)
 	}
 	return nil
 }

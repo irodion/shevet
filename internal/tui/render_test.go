@@ -89,6 +89,61 @@ func TestRenderPane_CursorReversesItsCell(t *testing.T) {
 	}
 }
 
+func TestRenderRegion_CropsAndPads(t *testing.T) {
+	g := grid.New(6, 3)
+	for i, r := range "abcdef" {
+		g.Set(i, 0, grid.Cell{Content: string(r), Width: 1})
+	}
+	g.Set(0, 2, grid.Cell{Content: "z", Width: 1})
+
+	// A 4x2 window on rows 1-2: row 1 is blank, row 2 clips to "z".
+	got := renderRegion(g, grid.Cursor{Hidden: true}, 0, 1, 4, 2)
+	lines := strings.Split(got, "\n")
+	if len(lines) != 2 {
+		t.Fatalf("rendered %d lines, want 2:\n%q", len(lines), got)
+	}
+	if plain := stripSGR(lines[0]); plain != "    " {
+		t.Errorf("row 0 = %q, want 4 blanks", plain)
+	}
+	if plain := stripSGR(lines[1]); plain != "z   " {
+		t.Errorf("row 1 = %q, want %q", plain, "z   ")
+	}
+
+	// A window wider and taller than the grid pads with blanks.
+	got = renderRegion(g, grid.Cursor{Hidden: true}, 0, 0, 8, 4)
+	lines = strings.Split(got, "\n")
+	if len(lines) != 4 {
+		t.Fatalf("rendered %d lines, want 4", len(lines))
+	}
+	if plain := stripSGR(lines[0]); plain != "abcdef  " {
+		t.Errorf("padded row = %q, want %q", plain, "abcdef  ")
+	}
+}
+
+func TestRenderRegion_WideCharAtTheEdgeBlanks(t *testing.T) {
+	g := grid.New(4, 1)
+	g.Set(0, 0, grid.Cell{Content: "A", Width: 1})
+	g.Set(1, 0, grid.Cell{Content: "你", Width: 2})
+
+	// A 2-wide window: the CJK cell would cross the right edge, so it
+	// renders as a blank instead of overflowing the region.
+	got := renderRegion(g, grid.Cursor{Hidden: true}, 0, 0, 2, 1)
+	if plain := stripSGR(got); plain != "A " {
+		t.Errorf("row = %q, want %q (wide cell blanked at the edge)", plain, "A ")
+	}
+}
+
+func TestRenderRegion_CursorOutsideRegionNotShown(t *testing.T) {
+	g := grid.New(4, 2)
+	g.Set(0, 0, grid.Cell{Content: "a", Width: 1})
+
+	// Cursor on row 1, region covers row 0 only: no reverse video anywhere.
+	got := renderRegion(g, grid.Cursor{X: 0, Y: 1}, 0, 0, 4, 1)
+	if strings.Contains(got, ";7m") {
+		t.Errorf("cursor outside the region still rendered:\n%q", got)
+	}
+}
+
 // stripSGR removes SGR escape sequences, leaving printable content.
 func stripSGR(s string) string {
 	var b strings.Builder

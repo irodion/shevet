@@ -71,6 +71,12 @@ func keyEvent(paneID, data string) *shevetv1.InputEvent {
 	}}
 }
 
+func resizeEvent(paneID string, w, h uint32) *shevetv1.InputEvent {
+	return &shevetv1.InputEvent{Event: &shevetv1.InputEvent_Resize{
+		Resize: &shevetv1.ResizeRequest{PaneId: paneID, Width: w, Height: h},
+	}}
+}
+
 // runSendInput runs the handler against a fresh fake stream, returning the
 // stream (for its recorded summary) and a channel carrying the handler's
 // return value.
@@ -157,6 +163,76 @@ func TestSendInput_IgnoresUnhandledEventKind(t *testing.T) {
 	}
 	if len(cmd.calls) != 0 || stream.summary.GetEvents() != 0 {
 		t.Errorf("an unhandled event kind was not ignored: calls=%v summary=%+v", cmd.calls, stream.summary)
+	}
+}
+
+func TestSendInput_ResizesThroughTmux(t *testing.T) {
+	hub := newPaneHub()
+	hub.put("%1", &watchedPane{})
+	cmd := &recordingCommander{}
+	svc := newHerdService(context.Background(), NewRegistry(), hub, cmd)
+
+	stream, done := runSendInput(svc, context.Background())
+	stream.in <- scriptedInput{ev: resizeEvent("%1", 120, 40)}
+	close(stream.in)
+
+	if err := waitErr(t, done); err != nil {
+		t.Fatalf("SendInput: %v", err)
+	}
+	if len(cmd.calls) != 1 {
+		t.Fatalf("issued %d tmux commands, want 1:\n%v", len(cmd.calls), cmd.calls)
+	}
+	if got := strings.Join(cmd.calls[0], " "); got != "resize-window -t %1 -x 120 -y 40" {
+		t.Errorf("resize call = %q", got)
+	}
+	if stream.summary.GetEvents() != 1 || stream.summary.GetBytes() != 0 {
+		t.Errorf("summary = %+v, want events=1 bytes=0", stream.summary)
+	}
+}
+
+func TestSendInput_DropsResizeForPaneNotInHerd(t *testing.T) {
+	hub := newPaneHub()
+	hub.put("%1", &watchedPane{})
+	cmd := &recordingCommander{}
+	svc := newHerdService(context.Background(), NewRegistry(), hub, cmd)
+
+	stream, done := runSendInput(svc, context.Background())
+	stream.in <- scriptedInput{ev: resizeEvent("%2", 80, 24)} // %2 is not in the Herd
+	close(stream.in)
+
+	if err := waitErr(t, done); err != nil {
+		t.Fatalf("SendInput: %v", err)
+	}
+	if len(cmd.calls) != 0 {
+		t.Errorf("resized a pane not in the Herd: %v", cmd.calls)
+	}
+}
+
+func TestSendInput_DropsImplausibleResize(t *testing.T) {
+	hub := newPaneHub()
+	hub.put("%1", &watchedPane{})
+	cmd := &recordingCommander{}
+	svc := newHerdService(context.Background(), NewRegistry(), hub, cmd)
+
+	stream, done := runSendInput(svc, context.Background())
+	for _, ev := range []*shevetv1.InputEvent{
+		resizeEvent("%1", 0, 24),
+		resizeEvent("%1", 80, 0),
+		resizeEvent("%1", maxPaneDim+1, 24),
+		resizeEvent("%1", 80, maxPaneDim+1),
+	} {
+		stream.in <- scriptedInput{ev: ev}
+	}
+	close(stream.in)
+
+	if err := waitErr(t, done); err != nil {
+		t.Fatalf("SendInput: %v", err)
+	}
+	if len(cmd.calls) != 0 {
+		t.Errorf("an implausible geometry reached tmux: %v", cmd.calls)
+	}
+	if stream.summary.GetEvents() != 0 {
+		t.Errorf("summary counted dropped resizes: %+v", stream.summary)
 	}
 }
 

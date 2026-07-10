@@ -1,0 +1,36 @@
+  Shevet   3 Panes · 1 Host
+
+  ╭─ claude · api refactor ───────────────────────────────╮  ╭─ claude · test suite ─────────────────────────────────╮
+  │> refactor the client dial path                        │  │$ go test ./...                                        │
+  │                                                       │  │ok   internal/emu     0.41s                            │
+  │  Reading internal/client/client.go...                 │  │ok   internal/wire    0.09s                            │
+  │  Edited 3 files, 214 insertions                       │  │FAIL internal/tui     0.88s                            │
+  │                                                       │  │宽字符 wide cells stay aligned                         │
+  │  Should I run the tests? [y/n]                        │  │                                                       │
+  │>                                                      │  │$                                                      │
+  │                                                       │  │                                                       │
+  │                                                       │  │                                                       │
+  │                                                       │  │                                                       │
+  │                                                       │  │                                                       │
+  │                                                       │  │                                                       │
+  │                                                       │  │                                                       │
+  │                                                       │  │                                                       │
+  ╰──────────────────────────────────────────────── h:%1 ─╯  ╰──────────────────────────────────────────────── h:%2 ─╯
+
+  ╭─ vim · release notes ─────────────────────────────────╮
+  │# Release notes                                        │
+  │                                                       │
+  │- Pane grid dashboard with live thumbnails             │
+  │- Focus follows the Client viewport                    │
+  │~                                                      │
+  │                                                       │
+  │                                                       │
+  │                                                       │
+  │                                                       │
+  │                                                       │
+  │                                                       │
+  │                                                       │
+  │                                                       │
+  │                                                       │
+  ╰──────────────────────────────────────────────── h:%3 ─╯
+ ↑↓←→ select  ·  enter focus  ·  ctrl+\ unfocus  ·  r refresh  ·  q quit

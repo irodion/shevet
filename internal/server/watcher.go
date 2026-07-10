@@ -353,6 +353,13 @@ type paneInfo struct {
 	title         string
 }
 
+// paneTitleFormat names a Pane for dashboards: the pane title when the
+// inner application set one (agents commonly title their terminal), else
+// the window name — tmux defaults an untouched pane title to the hostname
+// (#{host}), which says nothing about the Agent, while the window name is
+// what Spawn (and users) name the window.
+const paneTitleFormat = "#{?#{!=:#{pane_title},#{host}},#{pane_title},#{window_name}}"
+
 // reconcile realigns the Registry and the pane set with an authoritative
 // list-panes snapshot. One code path serves initial sync and every topology
 // change: create what's new, resize-and-reseed what changed, close what's
@@ -360,7 +367,7 @@ type paneInfo struct {
 // notifications is safe.
 func (w *watcher) reconcile(ctx context.Context) error {
 	lines, err := w.ctl.Command(ctx, "list-panes", "-s", "-t", "="+w.session,
-		"-F", "#{pane_id}\t#{pane_width}\t#{pane_height}\t#{pane_title}")
+		"-F", "#{pane_id}\t#{pane_width}\t#{pane_height}\t"+paneTitleFormat)
 	if err != nil {
 		return err
 	}

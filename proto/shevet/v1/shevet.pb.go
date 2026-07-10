@@ -626,13 +626,15 @@ func (*PaneExited) Descriptor() ([]byte, []int) {
 }
 
 // InputEvent is one event on the Control Input stream. The oneof is declared
-// additive: this slice carries keystrokes; focus acquisition, resize, paste,
-// and mouse events join it in later slices without breaking the wire.
+// additive: this slice carries keystrokes and resize requests; focus
+// acquisition, paste, and mouse events join it in later slices without
+// breaking the wire.
 type InputEvent struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Event:
 	//
 	//	*InputEvent_Keys
+	//	*InputEvent_Resize
 	Event         isInputEvent_Event `protobuf_oneof:"event"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -684,6 +686,15 @@ func (x *InputEvent) GetKeys() *KeyBytes {
 	return nil
 }
 
+func (x *InputEvent) GetResize() *ResizeRequest {
+	if x != nil {
+		if x, ok := x.Event.(*InputEvent_Resize); ok {
+			return x.Resize
+		}
+	}
+	return nil
+}
+
 type isInputEvent_Event interface {
 	isInputEvent_Event()
 }
@@ -692,7 +703,13 @@ type InputEvent_Keys struct {
 	Keys *KeyBytes `protobuf:"bytes,1,opt,name=keys,proto3,oneof"`
 }
 
+type InputEvent_Resize struct {
+	Resize *ResizeRequest `protobuf:"bytes,2,opt,name=resize,proto3,oneof"`
+}
+
 func (*InputEvent_Keys) isInputEvent_Event() {}
+
+func (*InputEvent_Resize) isInputEvent_Event() {}
 
 // KeyBytes is raw, already-encoded input destined for one Pane. The Client
 // re-encodes keystrokes to exact terminal bytes; the Server injects them
@@ -752,6 +769,74 @@ func (x *KeyBytes) GetData() []byte {
 	return nil
 }
 
+// ResizeRequest asks the Server to resize a Pane's tmux window to the given
+// grid size — the resize-on-focus contract: a focusing Client sends its
+// viewport size, and on unfocus the Pane's prior size, so the Pane always
+// matches whoever is driving it (ARCHITECTURE.md §3.2). The Server confirms
+// by the usual render path: tmux reports the change and a PaneResized (plus a
+// re-seed) flows to every watcher of the Pane.
+type ResizeRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// pane_id identifies the target Pane, as returned by ListPanes.
+	PaneId string `protobuf:"bytes,1,opt,name=pane_id,json=paneId,proto3" json:"pane_id,omitempty"`
+	// width and height are the requested grid size in cells.
+	Width         uint32 `protobuf:"varint,2,opt,name=width,proto3" json:"width,omitempty"`
+	Height        uint32 `protobuf:"varint,3,opt,name=height,proto3" json:"height,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResizeRequest) Reset() {
+	*x = ResizeRequest{}
+	mi := &file_shevet_v1_shevet_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResizeRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResizeRequest) ProtoMessage() {}
+
+func (x *ResizeRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_shevet_v1_shevet_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResizeRequest.ProtoReflect.Descriptor instead.
+func (*ResizeRequest) Descriptor() ([]byte, []int) {
+	return file_shevet_v1_shevet_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *ResizeRequest) GetPaneId() string {
+	if x != nil {
+		return x.PaneId
+	}
+	return ""
+}
+
+func (x *ResizeRequest) GetWidth() uint32 {
+	if x != nil {
+		return x.Width
+	}
+	return 0
+}
+
+func (x *ResizeRequest) GetHeight() uint32 {
+	if x != nil {
+		return x.Height
+	}
+	return 0
+}
+
 // SendInputSummary reports what a Control Input stream delivered, returned
 // when the Client half-closes it. It is a diagnostic acknowledgement, not a
 // per-event ack: input is fire-and-forward for typing latency.
@@ -767,7 +852,7 @@ type SendInputSummary struct {
 
 func (x *SendInputSummary) Reset() {
 	*x = SendInputSummary{}
-	mi := &file_shevet_v1_shevet_proto_msgTypes[12]
+	mi := &file_shevet_v1_shevet_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -779,7 +864,7 @@ func (x *SendInputSummary) String() string {
 func (*SendInputSummary) ProtoMessage() {}
 
 func (x *SendInputSummary) ProtoReflect() protoreflect.Message {
-	mi := &file_shevet_v1_shevet_proto_msgTypes[12]
+	mi := &file_shevet_v1_shevet_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -792,7 +877,7 @@ func (x *SendInputSummary) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SendInputSummary.ProtoReflect.Descriptor instead.
 func (*SendInputSummary) Descriptor() ([]byte, []int) {
-	return file_shevet_v1_shevet_proto_rawDescGZIP(), []int{12}
+	return file_shevet_v1_shevet_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *SendInputSummary) GetEvents() uint64 {
@@ -848,14 +933,19 @@ const file_shevet_v1_shevet_proto_rawDesc = "" +
 	"\x05width\x18\x01 \x01(\rR\x05width\x12\x16\n" +
 	"\x06height\x18\x02 \x01(\rR\x06height\"\f\n" +
 	"\n" +
-	"PaneExited\"@\n" +
+	"PaneExited\"t\n" +
 	"\n" +
 	"InputEvent\x12)\n" +
-	"\x04keys\x18\x01 \x01(\v2\x13.shevet.v1.KeyBytesH\x00R\x04keysB\a\n" +
+	"\x04keys\x18\x01 \x01(\v2\x13.shevet.v1.KeyBytesH\x00R\x04keys\x122\n" +
+	"\x06resize\x18\x02 \x01(\v2\x18.shevet.v1.ResizeRequestH\x00R\x06resizeB\a\n" +
 	"\x05event\"7\n" +
 	"\bKeyBytes\x12\x17\n" +
 	"\apane_id\x18\x01 \x01(\tR\x06paneId\x12\x12\n" +
-	"\x04data\x18\x02 \x01(\fR\x04data\"@\n" +
+	"\x04data\x18\x02 \x01(\fR\x04data\"V\n" +
+	"\rResizeRequest\x12\x17\n" +
+	"\apane_id\x18\x01 \x01(\tR\x06paneId\x12\x14\n" +
+	"\x05width\x18\x02 \x01(\rR\x05width\x12\x16\n" +
+	"\x06height\x18\x03 \x01(\rR\x06height\"@\n" +
 	"\x10SendInputSummary\x12\x16\n" +
 	"\x06events\x18\x01 \x01(\x04R\x06events\x12\x14\n" +
 	"\x05bytes\x18\x02 \x01(\x04R\x05bytes2\xdb\x01\n" +
@@ -876,7 +966,7 @@ func file_shevet_v1_shevet_proto_rawDescGZIP() []byte {
 	return file_shevet_v1_shevet_proto_rawDescData
 }
 
-var file_shevet_v1_shevet_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
+var file_shevet_v1_shevet_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
 var file_shevet_v1_shevet_proto_goTypes = []any{
 	(*ListPanesRequest)(nil),  // 0: shevet.v1.ListPanesRequest
 	(*ListPanesResponse)(nil), // 1: shevet.v1.ListPanesResponse
@@ -890,7 +980,8 @@ var file_shevet_v1_shevet_proto_goTypes = []any{
 	(*PaneExited)(nil),        // 9: shevet.v1.PaneExited
 	(*InputEvent)(nil),        // 10: shevet.v1.InputEvent
 	(*KeyBytes)(nil),          // 11: shevet.v1.KeyBytes
-	(*SendInputSummary)(nil),  // 12: shevet.v1.SendInputSummary
+	(*ResizeRequest)(nil),     // 12: shevet.v1.ResizeRequest
+	(*SendInputSummary)(nil),  // 13: shevet.v1.SendInputSummary
 }
 var file_shevet_v1_shevet_proto_depIdxs = []int32{
 	2,  // 0: shevet.v1.ListPanesResponse.panes:type_name -> shevet.v1.Pane
@@ -900,17 +991,18 @@ var file_shevet_v1_shevet_proto_depIdxs = []int32{
 	6,  // 4: shevet.v1.CellDamage.cells:type_name -> shevet.v1.CellPatch
 	7,  // 5: shevet.v1.CellDamage.cursor:type_name -> shevet.v1.Cursor
 	11, // 6: shevet.v1.InputEvent.keys:type_name -> shevet.v1.KeyBytes
-	0,  // 7: shevet.v1.HerdService.ListPanes:input_type -> shevet.v1.ListPanesRequest
-	3,  // 8: shevet.v1.HerdService.WatchPane:input_type -> shevet.v1.WatchPaneRequest
-	10, // 9: shevet.v1.HerdService.SendInput:input_type -> shevet.v1.InputEvent
-	1,  // 10: shevet.v1.HerdService.ListPanes:output_type -> shevet.v1.ListPanesResponse
-	4,  // 11: shevet.v1.HerdService.WatchPane:output_type -> shevet.v1.PaneUpdate
-	12, // 12: shevet.v1.HerdService.SendInput:output_type -> shevet.v1.SendInputSummary
-	10, // [10:13] is the sub-list for method output_type
-	7,  // [7:10] is the sub-list for method input_type
-	7,  // [7:7] is the sub-list for extension type_name
-	7,  // [7:7] is the sub-list for extension extendee
-	0,  // [0:7] is the sub-list for field type_name
+	12, // 7: shevet.v1.InputEvent.resize:type_name -> shevet.v1.ResizeRequest
+	0,  // 8: shevet.v1.HerdService.ListPanes:input_type -> shevet.v1.ListPanesRequest
+	3,  // 9: shevet.v1.HerdService.WatchPane:input_type -> shevet.v1.WatchPaneRequest
+	10, // 10: shevet.v1.HerdService.SendInput:input_type -> shevet.v1.InputEvent
+	1,  // 11: shevet.v1.HerdService.ListPanes:output_type -> shevet.v1.ListPanesResponse
+	4,  // 12: shevet.v1.HerdService.WatchPane:output_type -> shevet.v1.PaneUpdate
+	13, // 13: shevet.v1.HerdService.SendInput:output_type -> shevet.v1.SendInputSummary
+	11, // [11:14] is the sub-list for method output_type
+	8,  // [8:11] is the sub-list for method input_type
+	8,  // [8:8] is the sub-list for extension type_name
+	8,  // [8:8] is the sub-list for extension extendee
+	0,  // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_shevet_v1_shevet_proto_init() }
@@ -925,6 +1017,7 @@ func file_shevet_v1_shevet_proto_init() {
 	}
 	file_shevet_v1_shevet_proto_msgTypes[10].OneofWrappers = []any{
 		(*InputEvent_Keys)(nil),
+		(*InputEvent_Resize)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -932,7 +1025,7 @@ func file_shevet_v1_shevet_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_shevet_v1_shevet_proto_rawDesc), len(file_shevet_v1_shevet_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   13,
+			NumMessages:   14,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

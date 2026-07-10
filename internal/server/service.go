@@ -164,12 +164,20 @@ func (s *herdService) SendInput(stream shevetv1.HerdService_SendInputServer) err
 // error. An injection failure against a live Pane is returned as a gRPC error
 // that ends the stream.
 func (s *herdService) injectEvent(ctx context.Context, ev *shevetv1.InputEvent, summary *shevetv1.SendInputSummary) error {
-	keys := ev.GetKeys()
-	if keys == nil {
-		// A future event kind (focus, resize, paste, mouse). Ignore it
+	switch ev := ev.GetEvent().(type) {
+	case *shevetv1.InputEvent_Keys:
+		return s.injectKeys(ctx, ev.Keys, summary)
+	case *shevetv1.InputEvent_Resize:
+		return s.injectResize(ctx, ev.Resize, summary)
+	default:
+		// A future event kind (focus, paste, mouse). Ignore it
 		// forward-compatibly.
 		return nil
 	}
+}
+
+// injectKeys delivers one KeyBytes event to its Pane through the tmux seam.
+func (s *herdService) injectKeys(ctx context.Context, keys *shevetv1.KeyBytes, summary *shevetv1.SendInputSummary) error {
 	paneID, data := keys.GetPaneId(), keys.GetData()
 
 	// The Pane must be in the Herd. Resolving it here also means input can
@@ -187,6 +195,32 @@ func (s *herdService) injectEvent(ctx context.Context, ev *shevetv1.InputEvent, 
 	}
 	summary.Events++
 	summary.Bytes += uint64(len(data))
+	return nil
+}
+
+// injectResize realizes one ResizeRequest against tmux. A request for a Pane
+// not in the Herd is dropped like a keystroke would be (the Pane can exit
+// while the request is in flight), and so is an implausible geometry — the
+// same bound the watcher applies to tmux's own reports — so a garbled request
+// never reaches tmux. Confirmation is not synthesized here: tmux reports the
+// resize and the watcher relays it to every watcher of the Pane as a
+// PaneResized plus a re-seed.
+func (s *herdService) injectResize(ctx context.Context, req *shevetv1.ResizeRequest, summary *shevetv1.SendInputSummary) error {
+	paneID := req.GetPaneId()
+	w, h := int(req.GetWidth()), int(req.GetHeight())
+	if w <= 0 || h <= 0 || w > maxPaneDim || h > maxPaneDim {
+		return nil
+	}
+	if s.hub.get(paneID) == nil {
+		return nil
+	}
+	if s.injector == nil {
+		return status.Error(codes.Unavailable, "server has no tmux attachment to resize panes")
+	}
+	if err := inject.Resize(ctx, s.injector, paneID, w, h); err != nil {
+		return status.Errorf(codes.Unavailable, "resize pane %s: %v", paneID, err)
+	}
+	summary.Events++
 	return nil
 }
 

@@ -128,6 +128,9 @@ func TestParse_RejectsMalformedScripts(t *testing.T) {
 		{"read-raw without path", "read-raw 12"},
 		{"read-raw non-numeric count", "read-raw lots /tmp/x"},
 		{"read-raw negative count", "read-raw -1 /tmp/x"},
+		{"spam without text", "spam 100"},
+		{"spam non-numeric count", "spam lots noise"},
+		{"spam negative count", "spam -1 noise"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := Parse(strings.NewReader(tc.script)); err == nil {
@@ -145,6 +148,19 @@ func TestParse_ReadRaw(t *testing.T) {
 	st := s.steps[0]
 	if st.op != opReadRaw || st.count != 42 || st.path != "/run/shevet/corpus.bin" {
 		t.Errorf("step = %+v, want read-raw count=42 path=/run/shevet/corpus.bin", st)
+	}
+}
+
+func TestRun_SpamFloodsNumberedLines(t *testing.T) {
+	s := parse(t, "spam 3 flood line")
+
+	var out strings.Builder
+	if _, err := s.Run(strings.NewReader(""), &out); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	want := "flood line 1\nflood line 2\nflood line 3\n"
+	if out.String() != want {
+		t.Errorf("output = %q, want %q", out.String(), want)
 	}
 }
 
