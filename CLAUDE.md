@@ -9,7 +9,7 @@ Shevet is a single Go binary with two runtime roles, selected by subcommand (nev
 - `shevet serve` — the **Server**, a headless daemon on a Host. Attaches to tmux in control mode (`tmux -C`), runs a per-Pane VT emulator, derives each Agent's Status, and streams cell-level screen damage over gRPC.
 - `shevet connect <host>` — the **Client**, a Bubble Tea v2 TUI on the developer's laptop. Bootstraps and reaches the Server over SSH, renders the Pane grid, forwards input, and raises OS notifications.
 
-One developer, one or more Hosts they own. No multi-user identity, tenancy, or shared infrastructure. Hosts must be unix (tmux is load-bearing); the Client builds for any Go target including Windows.
+One developer, one or more Hosts they own. No multi-user identity, tenancy, or shared infrastructure. Hosts must be unix (tmux is load-bearing); the Client can target any Go platform including Windows. Note that `make cross`'s `PLATFORMS` only verifies the unix Host/Client matrix (linux and darwin) — a Windows Client build works but isn't part of that check.
 
 ## Commands
 
