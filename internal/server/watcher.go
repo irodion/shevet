@@ -306,11 +306,18 @@ func (w *watcher) scheduleResume(paneID string) {
 	})
 }
 
-// resumePane re-seeds a paused pane from its authoritative screen and resumes
-// its output. seed sets the barrier from the capture's stream position, so the
-// output tmux buffered while the pane was paused is dropped and the live
-// stream picks up without duplication — the same degraded reconstruction as a
-// reconnect (ARCHITECTURE.md §5.3).
+// resumePane re-seeds a paused pane from its authoritative screen, then resumes
+// its output. The order is the canonical tmux control-mode recovery and is
+// load-bearing: tmux never replays a paused pane's output on continue — it
+// expects a capture-pane resync — so seeding while still paused captures a
+// frozen, authoritative screen (verified against tmux: a burst produced while
+// paused yields no %output/%extended-output before or after continue). seed's
+// barrier, the capture's stream position, drops any pre-pause output still in
+// flight; and because continue is issued last, the only output that reaches the
+// pipeline afterward is produced after it (Seq past the barrier), composed onto
+// the seed with no duplication — the same degraded reconstruction as a reconnect
+// (ARCHITECTURE.md §5.3). Continuing last also keeps the producer throttled
+// until the seed has landed.
 //
 // Like pausePane, failures here are recovered rather than fatal: a re-seed or
 // continue that fails reschedules another resume, so a live pane never stays
