@@ -50,6 +50,12 @@ type subscriber struct {
 	lagged bool
 }
 
+// opsQueue bounds the per-pane op channel. It doubles as the saturation
+// threshold: when output() finds it full, the pane is producing faster than
+// the emulator drains and the watcher pauses it (ADR-0008). Sized so a normal
+// burst fits without a spurious pause, small enough to bound per-pane memory.
+const opsQueue = 64
+
 // pipeline is the per-Pane render pipeline: it owns the Pane's emulator
 // (one goroutine end-to-end, ADR-0006), coalesces damage on the 16ms
 // window, and fans flushes out to subscribers.
@@ -70,12 +76,17 @@ type opUnsubscribe struct{ sub *subscriber }
 type opClose struct{ exited bool }
 
 // newPipeline starts a pipeline for a pane with a w×h grid.
-func newPipeline(w, h int) *pipeline {
+func newPipeline(w, h int) *pipeline { return newPipelineWith(w, h, emu.New) }
+
+// newPipelineWith is newPipeline with an injectable emulator constructor, the
+// seam white-box tests use to drive coalescing and saturation deterministically
+// with a controllable emulator.
+func newPipelineWith(w, h int, newEmu func(w, h int) emu.Emulator) *pipeline {
 	p := &pipeline{
-		ops:  make(chan any, 64),
+		ops:  make(chan any, opsQueue),
 		done: make(chan struct{}),
 	}
-	go p.run(w, h)
+	go p.run(w, h, newEmu)
 	return p
 }
 
@@ -88,8 +99,29 @@ func (p *pipeline) post(op any) {
 	}
 }
 
-// output feeds pane output bytes into the emulator.
-func (p *pipeline) output(data []byte) { p.post(opOutput{data: data}) }
+// output feeds live pane output into the emulator without ever blocking the
+// caller: it reports whether the pipeline accepted the bytes. A false return
+// means the queue is full — the pane is producing faster than the emulator
+// drains — and is the watcher's signal to pause the pane in tmux rather than
+// let output accumulate on the Server heap (ADR-0008). A closed pane reports
+// accepted: a dead pane must not be paused.
+func (p *pipeline) output(data []byte) bool {
+	select {
+	case p.ops <- opOutput{data: data}:
+		return true
+	case <-p.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// deliverSeed feeds a capture-pane seed into the emulator, blocking until the
+// pipeline accepts it. Seeds are authoritative (they re-establish the whole
+// screen) and low-volume, so they must land even while live output is being
+// dropped for a saturated pane; the surrounding pause keeps the queue draining
+// so this does not block for long.
+func (p *pipeline) deliverSeed(data []byte) { p.post(opOutput{data: data}) }
 
 // resize resizes the pane's grid; subscribers get a resize update and the
 // following flushes re-establish content.
@@ -115,10 +147,10 @@ func (p *pipeline) close(exited bool) {
 
 // run is the pipeline goroutine: the single owner of the emulator, the
 // shadow grid, and the subscriber set.
-func (p *pipeline) run(w, h int) {
+func (p *pipeline) run(w, h int, newEmu func(w, h int) emu.Emulator) {
 	defer close(p.done)
 
-	term := emu.New(w, h)
+	term := newEmu(w, h)
 	shadow := grid.New(w, h) // last flushed state
 	scratch := grid.New(w, h)
 	cursor := grid.Cursor{}
@@ -201,6 +233,21 @@ func (p *pipeline) run(w, h int) {
 		}
 	}
 
+	// outBatch coalesces consecutive output ops into a single emulator write
+	// per wakeup (ADR-0008), so the parser's per-write overhead amortizes
+	// across a burst instead of being paid line by line.
+	var outBatch []byte
+	writeBatch := func() {
+		if len(outBatch) == 0 {
+			return
+		}
+		term.Write(outBatch) //nolint:errcheck // the emulator consumes everything
+		outBatch = outBatch[:0]
+		dirty = true
+		arm()
+	}
+
+	var burst []any
 	for {
 		var op any
 		select {
@@ -211,53 +258,75 @@ func (p *pipeline) run(w, h int) {
 			continue
 		}
 
-		switch op := op.(type) {
-		case opOutput:
-			term.Write(op.data) //nolint:errcheck // the emulator consumes everything
-			dirty = true
-			arm()
+		// Gather every op already queued for this wakeup in arrival order,
+		// then apply it with consecutive output coalesced. Draining the
+		// channel this way also keeps it short, so output()'s full-queue
+		// check tracks the emulator falling behind rather than scheduling.
+		burst = append(burst[:0], op)
+	gather:
+		for {
+			select {
+			case more := <-p.ops:
+				burst = append(burst, more)
+			default:
+				break gather
+			}
+		}
 
-		case opResize:
-			if w, h := term.Size(); w == op.w && h == op.h {
+		for _, op := range burst {
+			if o, ok := op.(opOutput); ok {
+				outBatch = append(outBatch, o.data...)
 				continue
 			}
-			term.Resize(op.w, op.h)
-			// The shadow resets so the next flush re-establishes all
-			// content relative to a default grid — exactly what
-			// subscribers hold after applying the resize.
-			shadow = grid.New(op.w, op.h)
-			scratch = grid.New(op.w, op.h)
-			u := renderUpdate{resized: &grid.Size{W: op.w, H: op.h}}
-			for sub := range subs {
-				deliver(sub, u)
-			}
-			dirty = true
-			arm()
+			// A control op is ordered against the output around it: flush
+			// the coalesced writes before applying it.
+			writeBatch()
+			switch op := op.(type) {
+			case opResize:
+				if w, h := term.Size(); w == op.w && h == op.h {
+					continue
+				}
+				term.Resize(op.w, op.h)
+				// The shadow resets so the next flush re-establishes all
+				// content relative to a default grid — exactly what
+				// subscribers hold after applying the resize.
+				shadow = grid.New(op.w, op.h)
+				scratch = grid.New(op.w, op.h)
+				u := renderUpdate{resized: &grid.Size{W: op.w, H: op.h}}
+				for sub := range subs {
+					deliver(sub, u)
+				}
+				dirty = true
+				arm()
 
-		case opSubscribe:
-			// Fold any pending damage into the shadow before adding the
-			// subscriber: its first message must be the sync's resize
-			// (the documented stream contract), never a stray damage
-			// batch from this flush. The fresh queue always has room for
-			// the sync.
-			flush()
-			subs[op.sub] = struct{}{}
-			op.sub.ch <- syncUpdate()
+			case opSubscribe:
+				// Fold any pending damage into the shadow before adding the
+				// subscriber: its first message must be the sync's resize
+				// (the documented stream contract), never a stray damage
+				// batch from this flush. The fresh queue always has room for
+				// the sync.
+				flush()
+				subs[op.sub] = struct{}{}
+				op.sub.ch <- syncUpdate()
 
-		case opUnsubscribe:
-			if _, ok := subs[op.sub]; ok {
-				delete(subs, op.sub)
-				close(op.sub.ch)
-			}
+			case opUnsubscribe:
+				if _, ok := subs[op.sub]; ok {
+					delete(subs, op.sub)
+					close(op.sub.ch)
+				}
 
-		case opClose:
-			for sub := range subs {
-				// The flag, set before the close, cannot be dropped the
-				// way a queued update to a full channel would be.
-				sub.exited = op.exited
-				close(sub.ch)
+			case opClose:
+				for sub := range subs {
+					// The flag, set before the close, cannot be dropped the
+					// way a queued update to a full channel would be.
+					sub.exited = op.exited
+					close(sub.ch)
+				}
+				return
 			}
-			return
 		}
+		// Flush output that trailed the last control op (or the whole burst
+		// when it was output-only).
+		writeBatch()
 	}
 }

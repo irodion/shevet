@@ -62,6 +62,15 @@ func (p *parser) feed(line string) (Event, *reply) {
 	case word == "%output":
 		pane, data, _ := strings.Cut(rest, " ")
 		return OutputEvent{PaneID: pane, Data: decodeOutput(data)}, nil
+	case word == "%extended-output":
+		// "%extended-output pane-id age ... : value": the flow-control form,
+		// delivered once pause-after is set. Same payload as %output.
+		pane, data := splitExtendedOutput(rest)
+		return OutputEvent{PaneID: pane, Data: decodeOutput(data)}, nil
+	case word == "%pause":
+		return PauseEvent{PaneID: strings.TrimSpace(rest)}, nil
+	case word == "%continue":
+		return ContinueEvent{PaneID: strings.TrimSpace(rest)}, nil
 	case word == "%exit":
 		return ExitEvent{Reason: rest}, nil
 	case topologyNotifications[word]:
@@ -79,6 +88,22 @@ func replyEnd(line string) (num string, isErr bool, ok bool) {
 		return "", false, false
 	}
 	return field(rest, 1), word == "%error", true
+}
+
+// splitExtendedOutput parses a %extended-output body ("pane-id age ... :
+// value") into the pane id and the still-escaped value. Per tmux(1), every
+// field between the pane id and a lone ':' is reserved for future use; only
+// the value after that ':' is output. A body missing the delimiter yields no
+// data rather than a misparse.
+func splitExtendedOutput(rest string) (pane, data string) {
+	pane, tail, ok := strings.Cut(rest, " ")
+	if !ok {
+		return rest, ""
+	}
+	if _, value, ok := strings.Cut(tail, " : "); ok {
+		return pane, value
+	}
+	return pane, ""
 }
 
 // field returns the i-th space-separated field of s, or "".

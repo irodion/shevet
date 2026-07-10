@@ -2,9 +2,11 @@ package server
 
 import (
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/irodion/shevet/internal/emu"
 	"github.com/irodion/shevet/internal/grid"
 	"github.com/irodion/shevet/internal/testutil"
 )
@@ -163,6 +165,106 @@ func TestPipeline_LaggedSubscriberResyncsOnIdlePane(t *testing.T) {
 	}
 
 	v.waitFor(func(g *grid.Grid) bool { return g.RowText(0) == final })
+}
+
+// gatedEmu is a test emulator whose Write blocks until the test releases a
+// gate, so a test can stall the pipeline's single goroutine and observe how
+// output submission and coalescing behave while the emulator is behind. It
+// signals entered on each Write entry (before blocking), which lets a test
+// wait until the pipeline is provably stalled with an empty queue.
+type gatedEmu struct {
+	w, h    int
+	gate    chan struct{} // Write blocks receiving from this until it is closed
+	entered chan struct{} // buffered: one value per Write entry
+	writes  atomic.Int32
+}
+
+func (e *gatedEmu) Write(p []byte) (int, error) {
+	e.entered <- struct{}{} // announce entry before blocking (buffered: never stalls)
+	<-e.gate                // released once the gate is closed
+	e.writes.Add(1)
+	return len(p), nil
+}
+func (e *gatedEmu) Resize(w, h int)         { e.w, e.h = w, h }
+func (e *gatedEmu) Size() (int, int)        { return e.w, e.h }
+func (e *gatedEmu) Snapshot(dst *grid.Grid) { dst.Resize(e.w, e.h) }
+func (e *gatedEmu) Cursor() grid.Cursor     { return grid.Cursor{} }
+
+// gatedPipeline starts a pipeline backed by a gatedEmu the test controls. The
+// emulator is built in the test goroutine and only its fields are touched from
+// the run goroutine, so the fake pointer is never assigned across goroutines.
+func gatedPipeline(t *testing.T, w, h int) (*pipeline, *gatedEmu, chan struct{}) {
+	t.Helper()
+	fake := &gatedEmu{gate: make(chan struct{}), entered: make(chan struct{}, 4*opsQueue)}
+	p := newPipelineWith(w, h, func(w, h int) emu.Emulator {
+		fake.w, fake.h = w, h
+		return fake
+	})
+	return p, fake, fake.gate
+}
+
+// TestPipeline_OutputReportsSaturation pins the backpressure signal (ADR-0008):
+// while the emulator is behind, output() fills the bounded queue and then
+// reports not-accepted instead of blocking the caller — the watcher's cue to
+// pause the pane in tmux.
+func TestPipeline_OutputReportsSaturation(t *testing.T) {
+	t.Parallel()
+	p, fake, gate := gatedPipeline(t, 20, 4)
+	t.Cleanup(func() { close(gate); p.close(false) })
+
+	// Stall the run goroutine inside Write with an empty queue, so what fills
+	// next is purely the bounded channel.
+	if !p.output([]byte("x")) {
+		t.Fatal("first output() was rejected before the pipeline could stall")
+	}
+	<-fake.entered
+
+	// The bounded queue fills, then output() must report saturation rather
+	// than block — within one queue's worth of submissions.
+	saturated := false
+	for i := 0; i < opsQueue+1; i++ {
+		if !p.output([]byte("x")) {
+			saturated = true
+			break
+		}
+	}
+	if !saturated {
+		t.Fatalf("output() never reported saturation after filling a %d-slot queue", opsQueue)
+	}
+}
+
+// TestPipeline_CoalescesQueuedOutputIntoOneWrite pins AC #4: output queued
+// while the emulator is behind drains as a single coalesced write when it
+// catches up, not one write per line.
+func TestPipeline_CoalescesQueuedOutputIntoOneWrite(t *testing.T) {
+	t.Parallel()
+	p, fake, gate := gatedPipeline(t, 20, 4)
+	t.Cleanup(func() { p.close(false) })
+
+	// Stall the pipeline inside the first write with an empty queue.
+	p.output([]byte("first"))
+	<-fake.entered
+
+	// Queue a burst behind the stalled write; it all sits in the channel.
+	const burst = 40
+	queued := 0
+	for i := 0; i < burst; i++ {
+		if p.output([]byte("y")) {
+			queued++
+		}
+	}
+
+	close(gate) // let the emulator catch up: first write completes, burst drains
+	<-fake.entered
+	testutil.Eventually(t, "queued burst to drain", func() (bool, string) {
+		return fake.writes.Load() >= 2, fmt.Sprintf("writes=%d", fake.writes.Load())
+	})
+
+	// The whole queued burst became a single coalesced write (plus the one
+	// in-flight first write): far fewer writes than outputs.
+	if got := fake.writes.Load(); int(got) > 2 {
+		t.Errorf("%d queued outputs produced %d emulator writes past the first; coalescing is not happening", queued, got-1)
+	}
 }
 
 func TestPipeline_CloseExitedTellsSubscribers(t *testing.T) {

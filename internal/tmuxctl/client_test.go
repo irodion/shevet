@@ -64,6 +64,26 @@ func TestAttach_FailsWithoutServer(t *testing.T) {
 	}
 }
 
+// TestOutput_ByteFidelityUnderFlowControl is TestOutput_ByteFidelity with
+// pause-after set: once flow control is on, tmux delivers pane output as
+// %extended-output instead of %output (ADR-0008), and the decoded bytes must
+// be byte-identical — the parser handling both forms is load-bearing.
+func TestOutput_ByteFidelityUnderFlowControl(t *testing.T) {
+	t.Parallel()
+	tm := tmuxtest.Start(t)
+	c, err := tmuxctl.Attach(context.Background(), tmuxctl.Options{
+		Socket:     tm.Socket(),
+		Session:    "holder",
+		PauseAfter: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	t.Cleanup(func() { c.Close() }) //nolint:errcheck // best-effort teardown
+
+	assertByteFidelity(t, tm, c)
+}
+
 func TestCommand_RepliesAndQuoting(t *testing.T) {
 	t.Parallel()
 	tm := tmuxtest.Start(t)
@@ -160,16 +180,13 @@ func TestCommand_SucceedsWhileEventsUndrained(t *testing.T) {
 	}
 }
 
-// TestOutput_ByteFidelity is the decoder's ground truth: bytes catted into a
-// pane must come out of the event stream byte-identical — escapes, UTF-8,
-// control characters, backslashes and all. The corpus is written newline-only
-// and the expectation maps NL to CRNL, because the pane's pty has output
+// assertByteFidelity cats a byte corpus into a pane on tm and checks that the
+// bytes come out of c's event stream byte-identical — escapes, UTF-8, control
+// characters, backslashes and all. The corpus is written newline-only and the
+// expectation maps NL to CRNL, because the pane's pty has output
 // post-processing (ONLCR) on, as any real Agent's pty does.
-func TestOutput_ByteFidelity(t *testing.T) {
-	t.Parallel()
-	tm := tmuxtest.Start(t)
-	c := attach(t, tm)
-
+func assertByteFidelity(t *testing.T, tm *tmuxtest.Tmux, c *tmuxctl.Client) {
+	t.Helper()
 	corpus := "plain\ntab\there\n\x1b[31mred\x1b[0m\x1b[1;5H\nutf8 你好 café 👩‍🚀\nback\\slash\ncontrol \x01\x06\x7f end\n"
 	want := []byte(strings.ReplaceAll(corpus, "\n", "\r\n"))
 
@@ -197,6 +214,13 @@ func TestOutput_ByteFidelity(t *testing.T) {
 	if !bytes.Equal(got, want) {
 		t.Errorf("output bytes differ:\n got  %q\n want %q", got, want)
 	}
+}
+
+// TestOutput_ByteFidelity is the decoder's ground truth against %output.
+func TestOutput_ByteFidelity(t *testing.T) {
+	t.Parallel()
+	tm := tmuxtest.Start(t)
+	assertByteFidelity(t, tm, attach(t, tm))
 }
 
 func TestTopologyEvents_OnWindowChanges(t *testing.T) {

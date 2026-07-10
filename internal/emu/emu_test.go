@@ -149,3 +149,23 @@ func TestSnapshot_CursorMotionOverwrite(t *testing.T) {
 		t.Errorf("row 0 = %q, want bbaa", got)
 	}
 }
+
+// TestNew_ScrollbackDisabled pins ADR-0008's ingest optimization: Shevet never
+// reads the emulator's own history, so New leaves scrollback at the API's
+// effective minimum. Scrolling far past the screen must not accumulate history.
+func TestNew_ScrollbackDisabled(t *testing.T) {
+	e := New(20, 4).(*vtEmulator)
+	if got := e.term.Scrollback().MaxLines(); got > 1 {
+		t.Errorf("scrollback max lines = %d, want the disabled minimum (<= 1)", got)
+	}
+
+	// Push far more lines than the screen holds; none should be retained.
+	for i := 0; i < 500; i++ {
+		if _, err := e.Write([]byte("line\r\n")); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	if got := e.term.ScrollbackLen(); got > 1 {
+		t.Errorf("scrollback retained %d lines after 500 scrolls, want <= 1", got)
+	}
+}

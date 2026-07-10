@@ -91,6 +91,59 @@ func TestParser_EndWithWrongNumberStaysInReply(t *testing.T) {
 	}
 }
 
+// TestParser_FlowControlNotifications covers the pause-after forms (ADR-0008):
+// %extended-output replaces %output once flow control is on, and %pause /
+// %continue bracket a paused pane.
+func TestParser_FlowControlNotifications(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		line string
+		want Event
+	}{
+		{
+			name: "extended-output decodes like output",
+			line: `%extended-output %1 0 : \033[31mred`,
+			want: OutputEvent{PaneID: "%1", Data: []byte("\x1b[31mred")},
+		},
+		{
+			name: "extended-output with nonzero age",
+			line: `%extended-output %7 1234 : hello`,
+			want: OutputEvent{PaneID: "%7", Data: []byte("hello")},
+		},
+		{
+			name: "extended-output tolerates reserved fields",
+			line: `%extended-output %2 5 someflag : data`,
+			want: OutputEvent{PaneID: "%2", Data: []byte("data")},
+		},
+		{
+			name: "extended-output value may contain a colon",
+			line: `%extended-output %3 0 : ratio 3:1`,
+			want: OutputEvent{PaneID: "%3", Data: []byte("ratio 3:1")},
+		},
+		{
+			name: "pause",
+			line: "%pause %4",
+			want: PauseEvent{PaneID: "%4"},
+		},
+		{
+			name: "continue",
+			line: "%continue %4",
+			want: ContinueEvent{PaneID: "%4"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &parser{}
+			ev, done := p.feed(tc.line)
+			if done != nil {
+				t.Fatalf("feed(%q) returned a reply %+v, want an event", tc.line, done)
+			}
+			if !reflect.DeepEqual(ev, tc.want) {
+				t.Errorf("feed(%q) = %+v, want %+v", tc.line, ev, tc.want)
+			}
+		})
+	}
+}
+
 func TestDecodeOutput(t *testing.T) {
 	for _, tc := range []struct {
 		name string
