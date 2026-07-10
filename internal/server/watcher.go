@@ -410,24 +410,32 @@ func (w *watcher) reconcile(ctx context.Context) error {
 }
 
 // seed initializes (or re-baselines) a pipeline from the pane's current
-// screen: rendered rows with their SGR styling (capture-pane -e), then the
-// cursor position. Output events that predate the capture are dropped via
-// the seed barrier — their bytes are already on the captured screen — so
-// the seed and the live stream compose without duplication or loss.
+// screen: rendered rows with their SGR styling (capture-pane -e) and the
+// cursor position, read as one atomic snapshot (see CommandsSeq). Output
+// events that predate the snapshot are dropped via the seed barrier — their
+// bytes are already on the captured screen — so the seed and the live stream
+// compose without duplication or loss.
 //
 // A seed is the documented degraded reconstruction (ARCHITECTURE.md §5.3):
 // exact visible content and styling, but no scrollback and no in-flight
 // escape state. Panes created after the Server attached skip the loss: they
 // are seeded from an empty screen.
 func (w *watcher) seed(ctx context.Context, paneID string, wp *watchedPane) error {
-	rows, seq, err := w.ctl.CommandSeq(ctx, "capture-pane", "-p", "-e", "-t", paneID)
+	// Capture the screen and read the cursor as one atomic control-mode
+	// sequence, so both — and the barrier — pin to a single stream position.
+	// Two separate commands let output land between them, making the rows,
+	// cursor, and barrier disagree and the replay run from the wrong origin
+	// (issue #53). The barrier is the snapshot's position (the first reply):
+	// output already on the captured screen has a smaller Seq and is dropped.
+	replies, seq, err := w.ctl.CommandsSeq(ctx,
+		[]string{"capture-pane", "-p", "-e", "-t", paneID},
+		[]string{"display-message", "-p", "-t", paneID, "#{cursor_x}\t#{cursor_y}"},
+	)
 	if err != nil {
 		return err
 	}
-	cursor, err := w.ctl.Command(ctx, "display-message", "-p", "-t", paneID, "#{cursor_x}\t#{cursor_y}")
-	if err != nil {
-		return err
-	}
+	// CommandsSeq returns one reply body per command on success.
+	rows, cursor := replies[0], replies[1]
 	cx, cy := 0, 0
 	if len(cursor) == 1 {
 		fmt.Sscanf(cursor[0], "%d\t%d", &cx, &cy) //nolint:errcheck // home cursor on mismatch beats failing the pane

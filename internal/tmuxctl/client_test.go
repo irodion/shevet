@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -104,6 +105,141 @@ func TestCommand_RepliesAndQuoting(t *testing.T) {
 	if _, err := c.Command(ctx, "frobnicate-hard"); err == nil {
 		t.Error("unknown command succeeded, want error-reply surfaced as error")
 	}
+}
+
+func TestCommandsSeq_RepliesInOrder(t *testing.T) {
+	t.Parallel()
+	tm := tmuxtest.Start(t)
+	c := attach(t, tm)
+
+	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitTimeout)
+	defer cancel()
+
+	replies, _, err := c.CommandsSeq(ctx,
+		[]string{"display-message", "-p", "first"},
+		[]string{"display-message", "-p", "second"},
+	)
+	if err != nil {
+		t.Fatalf("CommandsSeq: %v", err)
+	}
+	if len(replies) != 2 || len(replies[0]) != 1 || replies[0][0] != "first" || len(replies[1]) != 1 || replies[1][0] != "second" {
+		t.Errorf("replies = %q, want [[first] [second]]", replies)
+	}
+}
+
+// TestCommandsSeq_ErrorKeepsRepliesMatched pins the invariant the combined
+// command relies on: tmux answers one reply block per command even when one
+// errors, so a following command is never handed the wrong reply. Without it,
+// an errored sequence would leave a pending slot and desync the whole stream.
+func TestCommandsSeq_ErrorKeepsRepliesMatched(t *testing.T) {
+	t.Parallel()
+	tm := tmuxtest.Start(t)
+	c := attach(t, tm)
+
+	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitTimeout)
+	defer cancel()
+
+	// First command targets a nonexistent pane and errors mid-sequence.
+	if _, _, err := c.CommandsSeq(ctx,
+		[]string{"capture-pane", "-p", "-t", "%99999"},
+		[]string{"display-message", "-p", "unreached"},
+	); err == nil {
+		t.Fatal("a bad pane in the sequence did not surface an error")
+	}
+
+	// The reply stream must still be matched: a plain command gets its own
+	// reply, not a stranded block from the errored sequence.
+	lines, err := c.Command(ctx, "display-message", "-p", "still-matched")
+	if err != nil {
+		t.Fatalf("Command after errored sequence: %v", err)
+	}
+	if len(lines) != 1 || lines[0] != "still-matched" {
+		t.Errorf("reply after errored sequence = %q, want [still-matched] (stream desynced)", lines)
+	}
+}
+
+// TestCommandsSeq_AtomicSnapshotUnderFlood is the regression guard for issue
+// #53: a `;`-joined sequence observes one stream position. Under a continuous
+// flood, two #{history_size} reads in one CommandsSeq must be equal — no
+// %output landed between them — even as the size climbs across iterations.
+// Separately-sent commands would disagree, which is the seed skew this fixes.
+//
+// It runs both without flow control (plain %output) and with pause-after (the
+// %extended-output form the real Server attaches with), since the seed runs
+// under flow control and the atomicity must hold for that output form too.
+func TestCommandsSeq_AtomicSnapshotUnderFlood(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		pauseAfter time.Duration
+	}{
+		{"plain output", 0},
+		{"flow control", 2 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tm := tmuxtest.Start(t)
+			c, err := tmuxctl.Attach(context.Background(), tmuxctl.Options{
+				Socket:     tm.Socket(),
+				Session:    "holder",
+				PauseAfter: tc.pauseAfter,
+			})
+			if err != nil {
+				t.Fatalf("Attach: %v", err)
+			}
+			t.Cleanup(func() { c.Close() }) //nolint:errcheck // best-effort teardown
+			assertAtomicSnapshotUnderFlood(t, tm, c)
+		})
+	}
+}
+
+func assertAtomicSnapshotUnderFlood(t *testing.T, tm *tmuxtest.Tmux, c *tmuxctl.Client) {
+	t.Helper()
+
+	// A never-ending flood keeps output in flight for every iteration; drain
+	// the notification stream so the queue stays bounded while we probe.
+	pane := tm.NewWindow(t, "flood", "while true; do seq 1 100000; done")
+	tm.WaitForContent(t, pane, "1")
+	go func() {
+		for range c.Events() { //nolint:revive // discard: this test only probes via replies
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitTimeout)
+	defer cancel()
+
+	histRead := []string{"display-message", "-p", "-t", pane, "#{history_size}"}
+	var prev int
+	grew := false
+	for i := 0; i < 200; i++ {
+		replies, _, err := c.CommandsSeq(ctx, histRead, histRead)
+		if err != nil {
+			t.Fatalf("iteration %d: CommandsSeq: %v", i, err)
+		}
+		a, b := atoiReply(t, replies[0]), atoiReply(t, replies[1])
+		if a != b {
+			t.Fatalf("iteration %d: history_size not atomic: %d then %d — output interleaved between the sequence's replies", i, a, b)
+		}
+		if a > prev {
+			grew = true
+		}
+		prev = a
+	}
+	if !grew {
+		t.Fatal("history_size never grew; the flood did not exercise interleaving, so atomicity was not tested")
+	}
+}
+
+func atoiReply(t *testing.T, lines []string) int {
+	t.Helper()
+	if len(lines) != 1 {
+		t.Fatalf("want one reply line, got %q", lines)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(lines[0]))
+	if err != nil {
+		t.Fatalf("reply %q is not a number: %v", lines[0], err)
+	}
+	return n
 }
 
 func TestCommand_ConcurrentCallersGetTheirOwnReplies(t *testing.T) {
