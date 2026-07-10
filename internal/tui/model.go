@@ -96,12 +96,19 @@ func NewServers(servers []Server) ([]Server, error) {
 	return servers, nil
 }
 
-// refPane couples a Pane with its Client-scoped PaneRef — the Herd is
-// aggregated across connections, so a Pane must carry the Host alias that
-// resolves it back to the connection that owns it.
+// refPane is a Pane scoped by the Host alias it was fetched from — the Herd is
+// aggregated across connections, so a Pane must carry the alias that resolves
+// it back to the connection that owns it. The Client-scoped PaneRef is derived
+// from the two on demand, so the pane id is stored once (on Pane).
 type refPane struct {
-	Ref  herd.PaneRef
+	Host string
 	Pane herd.Pane
+}
+
+// Ref is the Pane's Client-scoped identity: its Host alias plus its
+// Server-scoped id.
+func (p refPane) Ref() herd.PaneRef {
+	return herd.PaneRef{Host: p.Host, ID: p.Pane.ID}
 }
 
 // Model is the dashboard's Bubble Tea model. Construct with New.
@@ -196,7 +203,7 @@ func fetchPanesCmd(ctx context.Context, servers []Server) tea.Cmd {
 				return loadFailedMsg{err: fmt.Errorf("host %s: %w", s.Alias, err)}
 			}
 			for _, p := range panes {
-				all = append(all, refPane{Ref: herd.PaneRef{Host: s.Alias, ID: p.ID}, Pane: p})
+				all = append(all, refPane{Host: s.Alias, Pane: p})
 			}
 		}
 		return panesLoadedMsg(all)
@@ -285,7 +292,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.panes) > 0 {
 			pane := m.panes[0]
 			m.watching = &pane
-			return m, watchPaneCmd(m.ctx, m.conns[pane.Ref.Host], pane.Ref)
+			return m, watchPaneCmd(m.ctx, m.conns[pane.Host], pane.Ref())
 		}
 
 	case loadFailedMsg:
@@ -347,7 +354,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if m.input == nil {
 			m.inputErr = nil
 			m.input = make(chan []byte, forwardBuffer)
-			ref := m.watching.Ref
+			ref := m.watching.Ref()
 			return m, forwardInputCmd(m.ctx, m.conns[ref.Host], ref, m.input)
 		}
 	}
@@ -383,7 +390,7 @@ func (m Model) View() tea.View {
 	case m.err != nil:
 		body = errorStyle.Render("Cannot reach Server: " + m.err.Error())
 	case m.view != nil && m.view.Exited:
-		body = statusStyle.Render(fmt.Sprintf("Pane %s exited", m.watching.Ref))
+		body = statusStyle.Render(fmt.Sprintf("Pane %s exited", m.watching.Ref()))
 	case m.view != nil && sized(m.view.Grid):
 		// The live Pane, full-screen and read-only. Content larger than
 		// the terminal is clipped by the renderer; resize-on-focus is the
@@ -392,7 +399,7 @@ func (m Model) View() tea.View {
 		view.AltScreen = true
 		return view
 	case m.watching != nil:
-		body = statusStyle.Render("Attaching to Pane " + m.watching.Ref.String() + "...")
+		body = statusStyle.Render("Attaching to Pane " + m.watching.Ref().String() + "...")
 	default:
 		body = renderHerdSummary(m.panes)
 	}
@@ -428,7 +435,7 @@ func renderHerdSummary(panes []refPane) string {
 	fmt.Fprintf(&b, "%d %s", len(panes), noun)
 
 	for _, p := range panes {
-		fmt.Fprintf(&b, "\n  %s  %s", p.Ref, p.Pane.Title)
+		fmt.Fprintf(&b, "\n  %s  %s", p.Ref(), p.Pane.Title)
 	}
 	return b.String()
 }

@@ -2,6 +2,8 @@ package tui
 
 import (
 	"context"
+	"maps"
+	"slices"
 	"testing"
 	"time"
 
@@ -64,26 +66,19 @@ func TestHerd_TwoLocalServersCoexist(t *testing.T) {
 	seen := make(map[string]bool, len(m.panes))
 	var alphaZero, betaZero bool
 	for _, p := range m.panes {
-		if seen[p.Ref.String()] {
-			t.Fatalf("PaneRef %s appeared twice — Hosts collided on identity", p.Ref)
+		ref := p.Ref()
+		if seen[ref.String()] {
+			t.Fatalf("PaneRef %s appeared twice — Hosts collided on identity", ref)
 		}
-		seen[p.Ref.String()] = true
+		seen[ref.String()] = true
 		switch {
-		case p.Ref.Host == "alpha" && p.Ref.ID == "%0":
+		case ref.Host == "alpha" && ref.ID == "%0":
 			alphaZero = true
-		case p.Ref.Host == "beta" && p.Ref.ID == "%0":
+		case ref.Host == "beta" && ref.ID == "%0":
 			betaZero = true
 		}
 	}
 	if !alphaZero || !betaZero {
-		t.Fatalf("want a %%0 under both Hosts; got refs %v", refKeys(seen))
+		t.Fatalf("want a %%0 under both Hosts; got refs %v", slices.Collect(maps.Keys(seen)))
 	}
-}
-
-func refKeys(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	return out
 }

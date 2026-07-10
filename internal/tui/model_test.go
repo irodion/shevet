@@ -493,10 +493,10 @@ func TestHerd_TwoServersShareIdsWithoutCollision(t *testing.T) {
 	if len(m.panes) != 2 {
 		t.Fatalf("aggregated %d panes, want 2 (one per Host)", len(m.panes))
 	}
-	if r0, r1 := m.panes[0].Ref, m.panes[1].Ref; r0 == r1 {
+	if r0, r1 := m.panes[0].Ref(), m.panes[1].Ref(); r0 == r1 {
 		t.Fatalf("panes from different Hosts collided on identity: both %s", r0)
 	}
-	if got := m.panes[0].Ref.String(); got != "alpha:%0" {
+	if got := m.panes[0].Ref().String(); got != "alpha:%0" {
 		t.Errorf("first PaneRef = %q, want alpha:%%0", got)
 	}
 
