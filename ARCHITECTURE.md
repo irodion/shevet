@@ -75,7 +75,7 @@ gRPC + Protobuf (kept from spec) over the SSH-tunneled unix socket (ADR-0003). T
 | Stream | Direction | Payload |
 |---|---|---|
 | Matrix Render | Server → Client | `CellDamage{pane, cells[]{x,y,ch,fg,bg,attrs}}`, `GridSnapshot`, `CursorMove`, `PaneResized` |
-| Control Input | Client → Server | `AcquireFocus{pane}`, `KeyBytes{pane, bytes}`, `Paste{pane, bytes}`, `Mouse{pane, x,y,btn,mods}`, `ResizeRequest` — input/resize honored only from the Focus Lease holder |
+| Control Input | Client → Server | `AcquireFocus{pane}`, `KeyBytes{pane, bytes}`, `Paste{pane, bytes}`, `Mouse{pane, x,y,btn,mods}`, `ResizeRequest`, `RestoreSize` (the Server records the size a stream's first resize of a Pane displaces and owns the restore — on request or when the stream dies) — input/resize honored only from the Focus Lease holder |
 | Telemetry | Server → Client | `StatusChanged{agent, status, reason, at}`, `AgentAdded/Removed`, `FocusChanged{pane, holder}`, `HostHealth` |
 
 Plus unary RPCs: `ListPanes`, `Spawn{host_dir, command}`, `Adopt{tmux_pane_id}`, `Release`, `Kill` (Spawned Agents only — Adopt semantics forbid killing, see CONTEXT.md), `FetchHistory{pane, from, to}`, `ServerInfo` (version handshake).

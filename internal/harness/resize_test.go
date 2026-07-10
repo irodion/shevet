@@ -80,3 +80,64 @@ func TestResize_RequestResizesPaneAndReseeds(t *testing.T) {
 	view.waitForSize(120, 40)
 	view.waitFor("sized >")
 }
+
+// TestResize_RestoreReturnsThePreFocusSize is the unfocus half of the
+// resize-on-focus contract against real tmux: the Server recorded the size
+// the focusing resize displaced, and a bare RestoreSize returns the Pane to
+// it — the Client never says what size that was.
+func TestResize_RestoreReturnsThePreFocusSize(t *testing.T) {
+	t.Parallel()
+	h := Start(t)
+
+	pane := h.StartAgent(t, "agent-a", "prompt sized > \nawait-line\n")
+	view := watchPane(t, h.Client, pane)
+	view.waitFor("sized >")
+	origW, origH := view.view.Grid.Size()
+
+	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitTimeout)
+	defer cancel()
+	in, err := h.Client.SendInput(ctx)
+	if err != nil {
+		t.Fatalf("SendInput: %v", err)
+	}
+	if err := in.SendResize(pane, 120, 40); err != nil {
+		t.Fatalf("SendResize: %v", err)
+	}
+	view.waitForSize(120, 40)
+
+	if err := in.SendRestore(pane); err != nil {
+		t.Fatalf("SendRestore: %v", err)
+	}
+	view.waitForSize(origW, origH)
+	view.waitFor("sized >") // the re-seeded screen is intact
+}
+
+// TestResize_StreamEndRestoresThePane covers the vanished-Client contract: a
+// Control Input stream that ends with a Pane still resized restores it — the
+// Pane must not stay stuck at a dead Client's viewport size.
+func TestResize_StreamEndRestoresThePane(t *testing.T) {
+	t.Parallel()
+	h := Start(t)
+
+	pane := h.StartAgent(t, "agent-a", "prompt sized > \nawait-line\n")
+	view := watchPane(t, h.Client, pane)
+	view.waitFor("sized >")
+	origW, origH := view.view.Grid.Size()
+
+	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitTimeout)
+	defer cancel()
+	in, err := h.Client.SendInput(ctx)
+	if err != nil {
+		t.Fatalf("SendInput: %v", err)
+	}
+	if err := in.SendResize(pane, 120, 40); err != nil {
+		t.Fatalf("SendResize: %v", err)
+	}
+	view.waitForSize(120, 40)
+
+	// The Client goes away without restoring.
+	if _, err := in.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	view.waitForSize(origW, origH)
+}

@@ -109,11 +109,12 @@ type resizeCall struct {
 // fakeSink records the requests forwarded through it, guarded because the
 // forwarding Cmd writes from its own goroutine while the test reads.
 type fakeSink struct {
-	mu      sync.Mutex
-	pane    string
-	keys    []byte
-	resizes []resizeCall
-	sendErr error
+	mu       sync.Mutex
+	pane     string
+	keys     []byte
+	resizes  []resizeCall
+	restores []string
+	sendErr  error
 }
 
 func (s *fakeSink) SendKeys(paneID string, data []byte) error {
@@ -135,6 +136,23 @@ func (s *fakeSink) SendResize(paneID string, w, h int) error {
 	}
 	s.resizes = append(s.resizes, resizeCall{pane: paneID, size: grid.Size{W: w, H: h}})
 	return nil
+}
+
+func (s *fakeSink) SendRestore(paneID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sendErr != nil {
+		return s.sendErr
+	}
+	s.restores = append(s.restores, paneID)
+	return nil
+}
+
+// restored returns the restore requests forwarded so far.
+func (s *fakeSink) restored() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.restores...)
 }
 
 // received returns the key bytes forwarded so far.
@@ -454,6 +472,25 @@ func waitResizes(t *testing.T, sink *fakeSink, want ...resizeCall) {
 	}
 }
 
+// waitRestores waits for the sink to have received exactly the given
+// restore requests.
+func waitRestores(t *testing.T, sink *fakeSink, want ...string) {
+	t.Helper()
+	testutil.Eventually(t, "forwarded restores", func() (bool, string) {
+		got := sink.restored()
+		return len(got) >= len(want), fmt.Sprintf("restores so far: %v", got)
+	})
+	got := sink.restored()
+	if len(got) != len(want) {
+		t.Fatalf("restores = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("restore %d = %v, want %v", i, got[i], want[i])
+		}
+	}
+}
+
 func TestFocus_ResizesPaneToViewportAndRestores(t *testing.T) {
 	m, conn := twoPaneModel(t) // viewport 120x30, panes 20x5
 	m = enterFocus(t, m)
@@ -467,15 +504,13 @@ func TestFocus_ResizesPaneToViewportAndRestores(t *testing.T) {
 		resizeCall{pane: "%1", size: grid.Size{W: 120, H: 30}},
 		resizeCall{pane: "%1", size: grid.Size{W: 140, H: 40}})
 
-	// The leader returns to the grid and restores the pre-focus size.
+	// The leader returns to the grid and asks the Server for the restore —
+	// no dimensions: the Server owns the pre-focus size.
 	m, _ = press(t, m, tea.KeyPressMsg{Code: '\\', Mod: tea.ModCtrl})
 	if m.focused() {
 		t.Fatal("the leader did not return from passthrough")
 	}
-	waitResizes(t, conn.sink,
-		resizeCall{pane: "%1", size: grid.Size{W: 120, H: 30}},
-		resizeCall{pane: "%1", size: grid.Size{W: 140, H: 40}},
-		resizeCall{pane: "%1", size: grid.Size{W: 20, H: 5}})
+	waitRestores(t, conn.sink, "%1")
 }
 
 func TestFocus_ShowsThePaneFullScreen(t *testing.T) {
@@ -746,67 +781,24 @@ func TestRefresh_FailureKeepsTheDashboard(t *testing.T) {
 	}
 }
 
-func TestFocus_RestoreSurvivesQuickRefocus(t *testing.T) {
+// TestFocus_RefocusCyclesAreRestorePerUnfocus pins the shape of the wire
+// conversation across rapid focus cycles: each focus sends the viewport,
+// each unfocus sends a bare restore. What size a restore lands on is the
+// Server's business — the Client carries no size bookkeeping, so no
+// interleaving of echoes and external resizes can confuse it.
+func TestFocus_RefocusCyclesAreRestorePerUnfocus(t *testing.T) {
 	m, conn := twoPaneModel(t) // pane %1 is 20x5, viewport 120x30
 	m = enterFocus(t, m)
-
-	// Unfocus queues the restore, then refocus lands before the restore's
-	// PaneResized round-trips: the grid still reads the viewport size, and
-	// naively sampling it would adopt 120x30 as the size to restore to.
 	m, _ = press(t, m, tea.KeyPressMsg{Code: '\\', Mod: tea.ModCtrl})
-	m = update(t, m, "%1", resize(120, 30)) // the focus resize echoing back, late
+	m = update(t, m, "%1", resize(120, 30)) // a focus resize echoing back, late
 	m = enterFocus(t, m)
 	_, _ = press(t, m, tea.KeyPressMsg{Code: '\\', Mod: tea.ModCtrl})
 
 	waitResizes(t, conn.sink,
 		resizeCall{pane: "%1", size: grid.Size{W: 120, H: 30}}, // focus
-		resizeCall{pane: "%1", size: grid.Size{W: 20, H: 5}},   // restore
 		resizeCall{pane: "%1", size: grid.Size{W: 120, H: 30}}, // refocus
-		resizeCall{pane: "%1", size: grid.Size{W: 20, H: 5}},   // the true size again
 	)
-}
-
-func TestFocus_RestoreSurvivesLateEchoAfterViewportChange(t *testing.T) {
-	m, conn := twoPaneModel(t) // pane %1 is 20x5, viewport 120x30
-	m = enterFocus(t, m)
-
-	// The terminal grows mid-focus, then the user unfocuses. The echo of
-	// the *first* focus resize (120x30) arrives only now — it no longer
-	// matches the current viewport (140x40), but it is still our own echo,
-	// not the restore landing: the pending 20x5 must survive it.
-	m = sizeMsg(t, m, 140, 40)
-	m, _ = press(t, m, tea.KeyPressMsg{Code: '\\', Mod: tea.ModCtrl})
-	m = update(t, m, "%1", resize(120, 30))
-
-	m = enterFocus(t, m)
-	_, _ = press(t, m, tea.KeyPressMsg{Code: '\\', Mod: tea.ModCtrl})
-
-	waitResizes(t, conn.sink,
-		resizeCall{pane: "%1", size: grid.Size{W: 120, H: 30}}, // focus
-		resizeCall{pane: "%1", size: grid.Size{W: 140, H: 40}}, // terminal grew
-		resizeCall{pane: "%1", size: grid.Size{W: 20, H: 5}},   // restore
-		resizeCall{pane: "%1", size: grid.Size{W: 140, H: 40}}, // refocus
-		resizeCall{pane: "%1", size: grid.Size{W: 20, H: 5}},   // the true size again
-	)
-}
-
-func TestFocus_ExternalResizeSettlesThePendingRestore(t *testing.T) {
-	m, _ := twoPaneModel(t)
-	m = enterFocus(t, m)
-	m = update(t, m, "%1", resize(120, 30)) // our focus resize echoes back
-	m, _ = press(t, m, tea.KeyPressMsg{Code: '\\', Mod: tea.ModCtrl})
-
-	// While the 20x5 restore is in flight, someone resizes the pane from
-	// the tmux side: the world moved on, so the stale restore target must
-	// be forgotten — the next focus samples the canonical size afresh.
-	m = update(t, m, "%1", resize(66, 22))
-	if _, ok := m.pending[testRef("%1")]; ok {
-		t.Error("an external resize did not settle the pending restore")
-	}
-	m = enterFocus(t, m)
-	if m.restore != (grid.Size{W: 66, H: 22}) {
-		t.Errorf("restore = %v, want the externally set 66x22", m.restore)
-	}
+	waitRestores(t, conn.sink, "%1", "%1")
 }
 
 func TestFocus_StalledInputStreamDropsToGridInsteadOfBlocking(t *testing.T) {
@@ -822,7 +814,8 @@ func TestFocus_StalledInputStreamDropsToGridInsteadOfBlocking(t *testing.T) {
 	// Fill the queue past its depth. This must never block Update — a
 	// frozen dashboard that cannot even quit is the failure mode — and
 	// once the buffer overflows, the stream is declared stalled: back to
-	// the grid, footer notice, true size kept as pending.
+	// the grid, footer notice (the Server restores the Pane's size when
+	// the dead stream ends).
 	for i := 0; i <= forwardBuffer; i++ {
 		m, _ = press(t, m, tea.KeyPressMsg{Code: 'x', Text: "x"})
 	}
@@ -831,9 +824,6 @@ func TestFocus_StalledInputStreamDropsToGridInsteadOfBlocking(t *testing.T) {
 	}
 	if m.inputErrs[testAlias] == nil {
 		t.Error("the stalled stream was not surfaced")
-	}
-	if got := m.pending[testRef("%1")]; got != (grid.Size{W: 20, H: 5}) {
-		t.Errorf("pending restore = %v, want the pre-focus 20x5", got)
 	}
 	// The dashboard is alive: q still quits.
 	_, cmd := press(t, m, tea.KeyPressMsg{Code: 'q', Text: "q"})

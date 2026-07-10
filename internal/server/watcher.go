@@ -26,9 +26,15 @@ type TmuxOptions struct {
 
 // watchedPane is the per-pane state: the render pipeline plus the watcher's
 // bookkeeping. The pipe field is immutable after construction and safe to
-// read concurrently; the other fields belong to the watcher goroutine.
+// read concurrently; size is guarded (the watcher writes it on reconcile,
+// the input service reads it to record pre-focus sizes); the remaining
+// fields belong to the watcher goroutine.
 type watchedPane struct {
-	pipe          *pipeline
+	pipe *pipeline
+
+	// sizeMu guards width and height, the pane's authoritative geometry
+	// from the latest reconcile.
+	sizeMu        sync.Mutex
 	width, height int
 
 	// seedBarrier drops output events that predate the pane's latest
@@ -41,6 +47,20 @@ type watchedPane struct {
 	// scheduled resume re-seeds from the authoritative screen and supersedes
 	// it. Watcher-goroutine state, no lock.
 	paused bool
+}
+
+// size returns the pane's geometry as of the latest reconcile.
+func (wp *watchedPane) size() (w, h int) {
+	wp.sizeMu.Lock()
+	defer wp.sizeMu.Unlock()
+	return wp.width, wp.height
+}
+
+// setSize records the pane's geometry from a reconcile snapshot.
+func (wp *watchedPane) setSize(w, h int) {
+	wp.sizeMu.Lock()
+	defer wp.sizeMu.Unlock()
+	wp.width, wp.height = w, h
 }
 
 // paneHub is the single map of live panes, shared between the watcher
@@ -388,19 +408,22 @@ func (w *watcher) reconcile(ctx context.Context) error {
 			// New pane: pipeline plus a seed of its current screen —
 			// which is empty for panes born after the Server attached,
 			// making them full-fidelity from their first byte.
-			wp = &watchedPane{pipe: newPipeline(info.width, info.height), width: info.width, height: info.height}
+			wp = &watchedPane{pipe: newPipeline(info.width, info.height)}
+			wp.setSize(info.width, info.height)
 			w.hub.put(info.id, wp)
 			if err := w.seed(ctx, info.id, wp); err != nil {
 				return err
 			}
-		case wp.width != info.width || wp.height != info.height:
-			// Resized pane: tmux reflows content in ways an emulator
-			// resize does not reproduce, so resize and re-seed from the
-			// authoritative screen.
-			wp.width, wp.height = info.width, info.height
-			wp.pipe.resize(info.width, info.height)
-			if err := w.seed(ctx, info.id, wp); err != nil {
-				return err
+		default:
+			if pw, ph := wp.size(); pw != info.width || ph != info.height {
+				// Resized pane: tmux reflows content in ways an emulator
+				// resize does not reproduce, so resize and re-seed from
+				// the authoritative screen.
+				wp.setSize(info.width, info.height)
+				wp.pipe.resize(info.width, info.height)
+				if err := w.seed(ctx, info.id, wp); err != nil {
+					return err
+				}
 			}
 		}
 	}

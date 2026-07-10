@@ -46,11 +46,13 @@ type Conn interface {
 }
 
 // InputSink is the Control Input stream as the dashboard drives it: forward
-// encoded keystrokes with SendKeys and resize requests with SendResize.
-// *client.InputStream implements it.
+// encoded keystrokes with SendKeys, resize requests with SendResize, and
+// return a Pane to its pre-focus size with SendRestore. *client.InputStream
+// implements it.
 type InputSink interface {
 	SendKeys(paneID string, data []byte) error
 	SendResize(paneID string, w, h int) error
+	SendRestore(paneID string) error
 }
 
 // clientConn adapts *client.Client to Conn (its stream methods return the
@@ -155,27 +157,14 @@ type Model struct {
 	// Focus state. The grid is read-only; focusing a Pane switches to
 	// passthrough, where keystrokes are encoded and forwarded and only the
 	// leader (Ctrl-\) returns. focus is the focused Pane, zero on the grid
-	// (a real PaneRef always carries a Host alias). restore is the focused
-	// Pane's pre-focus canonical size, sent back as a resize on unfocus.
+	// (a real PaneRef always carries a Host alias).
 	//
-	// pending tracks restores that have been sent (or should have been) but
-	// not yet confirmed by a PaneResized. It is what makes the pre-focus
-	// size survive a quick unfocus→refocus: the Client-side grid still
-	// reads the viewport size until the restore round-trips through tmux,
-	// so sampling it again would adopt the viewport as the size to restore
-	// to — and the Pane's true size would be lost for good.
-	//
-	// imposed tracks, per Pane, the focus resizes this Client has sent
-	// whose confirming PaneResized has not yet arrived (a multiset: the
-	// same size can be in flight twice across a refocus). It is how a late
-	// echo of our own resize — which can differ from the current viewport
-	// if the terminal changed mid-focus — is told apart from the restore
-	// landing or a genuinely external resize: only the latter two settle a
-	// pending restore.
-	focus   herd.PaneRef
-	restore grid.Size
-	pending map[herd.PaneRef]grid.Size
-	imposed map[herd.PaneRef][]grid.Size
+	// The Pane's pre-focus size is not tracked here: the Server records it
+	// when the focusing resize arrives and restores it on RestoreSize (or
+	// when the input stream dies) — so the Client never has to attribute a
+	// resize to itself or to the world, and an external resize can never
+	// be mistaken for our own echo.
+	focus herd.PaneRef
 
 	// Input plumbing: one generation of forwarding plumbing per Host (see
 	// inputConn), opened lazily on the first focus of one of its Panes and
@@ -203,8 +192,6 @@ func New(ctx context.Context, servers []Server) Model {
 		conns:     conns,
 		ctx:       ctx,
 		views:     make(map[herd.PaneRef]*paneState),
-		pending:   make(map[herd.PaneRef]grid.Size),
-		imposed:   make(map[herd.PaneRef][]grid.Size),
 		inputs:    make(map[string]*inputConn),
 		inputErrs: make(map[string]error),
 	}
@@ -310,13 +297,14 @@ func recvCmd(ref herd.PaneRef, stream PaneStream) tea.Cmd {
 	}
 }
 
-// inputReq is one item on a Host's forwarding channel: encoded keystrokes or
-// a resize request, always for one Pane. Exactly one of keys and resize is
-// set.
+// inputReq is one item on a Host's forwarding channel: encoded keystrokes, a
+// resize request, or a size restore, always for one Pane. Exactly one of
+// keys, resize, and restore is set.
 type inputReq struct {
-	paneID string
-	keys   []byte
-	resize *grid.Size
+	paneID  string
+	keys    []byte
+	resize  *grid.Size
+	restore bool
 }
 
 // inputConn is one generation of a Host's input plumbing: the request queue
@@ -364,9 +352,12 @@ func forwardInputCmd(ctx context.Context, conn Conn, host string, gen *inputConn
 				// The PaneRef routed us to this Host's connection; the wire
 				// carries the bare Server-scoped id.
 				var err error
-				if req.resize != nil {
+				switch {
+				case req.restore:
+					err = sink.SendRestore(req.paneID)
+				case req.resize != nil:
 					err = sink.SendResize(req.paneID, req.resize.W, req.resize.H)
-				} else {
+				default:
 					err = sink.SendKeys(req.paneID, req.keys)
 				}
 				if err != nil {
@@ -398,15 +389,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		if m.focused() {
-			// The viewport is the focused Pane's size; track it. queueResize
-			// can drop focus (a stalled stream), so only a resize that was
-			// actually queued is recorded as in flight.
-			size := grid.Size{W: m.width, H: m.height}
-			ref := m.focus
-			m.queueResize(ref, size)
-			if m.focused() {
-				m.impose(ref, size)
-			}
+			// The viewport is the focused Pane's size; track it.
+			m.queueResize(m.focus, grid.Size{W: m.width, H: m.height})
 		}
 
 	case tea.KeyPressMsg:
@@ -443,37 +427,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		st.view.Apply(msg.update)
-		if r := msg.update.Resized; r != nil && !m.consumeImposed(msg.ref, *r) && m.focus != msg.ref {
-			// Not one of our own focus resizes echoing back, and we are not
-			// driving the Pane: this is the pending restore landing, or an
-			// external resize superseding it. Either way the canonical size
-			// is trustworthy again, so the bookkeeping has served its
-			// purpose.
-			//
-			// Echoes are matched by size, not by a request id, and that is
-			// deliberate: the watcher coalesces notification bursts into
-			// one reconcile, so an intermediate resize's confirmation may
-			// never be emitted at all — correlation by id would strand the
-			// bookkeeping on acks that legitimately never come. The price
-			// is a narrow ambiguity: an external resize that exactly equals
-			// an in-flight focus size, landing while unfocused and followed
-			// by a refocus before the restore settles, is mistaken for our
-			// echo, and the next unfocus restores the pre-focus size over
-			// it — a wrong-size Pane the next resize corrects, not a wedge.
-			// The real fix is the Focus Lease slice (#14): the Server
-			// records the pre-focus size at lease acquire and restores it
-			// at release, deleting this client-side bookkeeping entirely.
-			delete(m.pending, msg.ref)
-			delete(m.imposed, msg.ref)
-		}
 		if st.view.Exited {
 			if m.focus == msg.ref {
 				// The focused Pane exited under our fingers: back to the
 				// grid. Its card keeps the final screen; nothing to restore.
 				m.focus = herd.PaneRef{}
 			}
-			delete(m.pending, msg.ref)
-			delete(m.imposed, msg.ref)
 			return m, nil // stream is over; the Server sends nothing after exited
 		}
 		return m, recvCmd(msg.ref, msg.stream)
@@ -486,8 +445,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		st.err = msg.err
 		if m.focus == msg.ref {
 			// Blind passthrough is a trap: drop to the grid, where the card
-			// wears the failure. The Pane itself may be fine, so its size is
-			// still restored.
+			// wears the failure. The Pane itself may be fine, so its size
+			// is still restored (unfocus asks the Server for it).
 			m.unfocus()
 		}
 
@@ -509,9 +468,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // queue overflowed because nothing was draining it — and drops back to the
 // grid if its Pane was focused. The cancel aborts the generation's stream,
 // so a wedged send can neither replay its backlog later nor outlive its
-// replacement; the next focus opens a fresh generation. The restore that
-// can no longer be sent is recorded as pending, so the next focus/unfocus
-// cycle still restores the true pre-focus size.
+// replacement; the next focus opens a fresh generation. No restore is sent:
+// the dying stream is what carried the Server's size record, and the Server
+// restores every Pane the stream left resized when it ends.
 func (m *Model) dropInput(host string, err error) {
 	m.inputErrs[host] = err
 	if gen := m.inputs[host]; gen != nil {
@@ -519,37 +478,19 @@ func (m *Model) dropInput(host string, err error) {
 		delete(m.inputs, host)
 	}
 	if m.focus.Host == host {
-		m.pending[m.focus] = m.restore
 		m.focus = herd.PaneRef{}
 	}
 }
 
-// impose records a focus resize as in flight, until its PaneResized echoes
-// back.
-func (m *Model) impose(ref herd.PaneRef, size grid.Size) {
-	m.imposed[ref] = append(m.imposed[ref], size)
-}
-
-// consumeImposed removes one in-flight focus resize matching an arriving
-// PaneResized, reporting whether the resize was our own echo.
-func (m *Model) consumeImposed(ref herd.PaneRef, size grid.Size) bool {
-	for i, s := range m.imposed[ref] {
-		if s == size {
-			m.imposed[ref] = append(m.imposed[ref][:i], m.imposed[ref][i+1:]...)
-			if len(m.imposed[ref]) == 0 {
-				delete(m.imposed, ref)
-			}
-			return true
+// unfocus returns to the grid, asking the Server to restore the focused
+// Pane's pre-focus size (which the Server recorded when focus began).
+func (m *Model) unfocus() {
+	if gen := m.inputs[m.focus.Host]; gen != nil {
+		if !send(gen.ch, inputReq{paneID: m.focus.ID, restore: true}) {
+			m.dropInput(m.focus.Host, errStalledInput)
+			return // dropInput already left focus; the Server restores on stream death
 		}
 	}
-	return false
-}
-
-// unfocus returns to the grid, sending the focused Pane its pre-focus size
-// and remembering it as pending until a PaneResized confirms it landed.
-func (m *Model) unfocus() {
-	m.queueResize(m.focus, m.restore)
-	m.pending[m.focus] = m.restore
 	m.focus = herd.PaneRef{}
 }
 
@@ -588,8 +529,6 @@ func (m Model) applyHerd(panes []refPane) (tea.Model, tea.Cmd) {
 	for ref := range m.views {
 		if !live[ref] {
 			delete(m.views, ref)
-			delete(m.pending, ref)
-			delete(m.imposed, ref)
 		}
 	}
 	if m.focused() && !live[m.focus] {
@@ -655,11 +594,11 @@ func (m *Model) moveSelection(dx, dy int) {
 }
 
 // focusSelected enters the selected Pane: passthrough input, full-screen
-// view, and the Pane resized to the Client viewport. The Pane's canonical
-// size at this moment is remembered and restored on unfocus. Focusing needs
-// a live, sized Pane — one whose render stream is up, or passthrough would
-// be typing into a frozen frame — and a known viewport; otherwise the key
-// is ignored.
+// view, and the Pane resized to the Client viewport (the Server records the
+// size this displaces and restores it on unfocus). Focusing needs a live,
+// sized Pane — one whose render stream is up, or passthrough would be
+// typing into a frozen frame — and a known viewport; otherwise the key is
+// ignored.
 func (m Model) focusSelected() (Model, tea.Cmd) {
 	if m.selected >= len(m.panes) || m.width <= 0 || m.height <= 0 {
 		return m, nil
@@ -671,15 +610,6 @@ func (m Model) focusSelected() (Model, tea.Cmd) {
 	}
 
 	m.focus = ref
-	if p, ok := m.pending[ref]; ok {
-		// A restore is still in flight for this Pane, so the grid reads a
-		// size we imposed, not the Pane's own. The pending target is the
-		// true pre-focus size; keep restoring to it.
-		m.restore = p
-	} else {
-		w, h := st.view.Grid.Size()
-		m.restore = grid.Size{W: w, H: h}
-	}
 
 	// Open this Host's input generation when there isn't a live one —
 	// including a retry after a prior failure. Requests issued before the
@@ -700,7 +630,6 @@ func (m Model) focusSelected() (Model, tea.Cmd) {
 		m.dropInput(ref.Host, errStalledInput)
 		return m, cmd
 	}
-	m.impose(ref, viewport)
 	return m, cmd
 }
 

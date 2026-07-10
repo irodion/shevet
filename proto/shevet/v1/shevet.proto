@@ -122,13 +122,14 @@ message PaneResized {
 message PaneExited {}
 
 // InputEvent is one event on the Control Input stream. The oneof is declared
-// additive: this slice carries keystrokes and resize requests; focus
-// acquisition, paste, and mouse events join it in later slices without
-// breaking the wire.
+// additive: this slice carries keystrokes, resize requests, and size
+// restores; focus acquisition, paste, and mouse events join it in later
+// slices without breaking the wire.
 message InputEvent {
   oneof event {
     KeyBytes keys = 1;
     ResizeRequest resize = 2;
+    RestoreSize restore = 3;
   }
 }
 
@@ -145,11 +146,13 @@ message KeyBytes {
 }
 
 // ResizeRequest asks the Server to resize a Pane's tmux window to the given
-// grid size — the resize-on-focus contract: a focusing Client sends its
-// viewport size, and on unfocus the Pane's prior size, so the Pane always
-// matches whoever is driving it (ARCHITECTURE.md §3.2). The Server confirms
-// by the usual render path: tmux reports the change and a PaneResized (plus a
-// re-seed) flows to every watcher of the Pane.
+// grid size — the focus half of resize-on-focus: a focusing Client sends its
+// viewport size (and keeps sending it as its terminal changes), so the Pane
+// always matches whoever is driving it (ARCHITECTURE.md §3.2). The Server
+// records the Pane's size before this stream's first resize of it, for
+// RestoreSize. Confirmation rides the usual render path: tmux reports the
+// change and a PaneResized (plus a re-seed) flows to every watcher of the
+// Pane.
 message ResizeRequest {
   // pane_id identifies the target Pane, as returned by ListPanes.
   string pane_id = 1;
@@ -157,6 +160,18 @@ message ResizeRequest {
   // width and height are the requested grid size in cells.
   uint32 width = 2;
   uint32 height = 3;
+}
+
+// RestoreSize returns a Pane to the size it had before this stream's first
+// ResizeRequest for it — the unfocus half of resize-on-focus. The Server
+// owns the pre-focus size, so a Client carries no size bookkeeping and an
+// external resize can never be mistaken for the Client's own echo. Without
+// a recorded size (no prior resize on this stream) it is a no-op. A stream
+// that ends with unrestored Panes restores them implicitly: a vanished
+// Client must not leave a Pane stuck at its viewport size.
+message RestoreSize {
+  // pane_id identifies the target Pane, as returned by ListPanes.
+  string pane_id = 1;
 }
 
 // SendInputSummary reports what a Control Input stream delivered, returned

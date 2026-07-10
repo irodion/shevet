@@ -77,6 +77,33 @@ func resizeEvent(paneID string, w, h uint32) *shevetv1.InputEvent {
 	}}
 }
 
+func restoreEvent(paneID string) *shevetv1.InputEvent {
+	return &shevetv1.InputEvent{Event: &shevetv1.InputEvent_Restore{
+		Restore: &shevetv1.RestoreSize{PaneId: paneID},
+	}}
+}
+
+// sizedPane is a hub entry with authoritative geometry, as a reconcile
+// would have left it.
+func sizedPane(w, h int) *watchedPane {
+	wp := &watchedPane{}
+	wp.setSize(w, h)
+	return wp
+}
+
+// wantCalls asserts the commander saw exactly these tmux commands, in order.
+func wantCalls(t *testing.T, cmd *recordingCommander, want ...string) {
+	t.Helper()
+	if len(cmd.calls) != len(want) {
+		t.Fatalf("issued %d tmux commands, want %d:\n%v", len(cmd.calls), len(want), cmd.calls)
+	}
+	for i, w := range want {
+		if got := strings.Join(cmd.calls[i], " "); got != w {
+			t.Errorf("call %d = %q, want %q", i, got, w)
+		}
+	}
+}
+
 // runSendInput runs the handler against a fresh fake stream, returning the
 // stream (for its recorded summary) and a channel carrying the handler's
 // return value.
@@ -233,6 +260,107 @@ func TestSendInput_DropsImplausibleResize(t *testing.T) {
 	}
 	if stream.summary.GetEvents() != 0 {
 		t.Errorf("summary counted dropped resizes: %+v", stream.summary)
+	}
+}
+
+func TestSendInput_RestoreReturnsThePreResizeSize(t *testing.T) {
+	hub := newPaneHub()
+	hub.put("%1", sizedPane(80, 24))
+	cmd := &recordingCommander{}
+	svc := newHerdService(context.Background(), NewRegistry(), hub, cmd)
+
+	stream, done := runSendInput(svc, context.Background())
+	stream.in <- scriptedInput{ev: resizeEvent("%1", 120, 40)}
+	stream.in <- scriptedInput{ev: resizeEvent("%1", 140, 50)} // viewport tracking: the record survives
+	stream.in <- scriptedInput{ev: restoreEvent("%1")}
+	stream.in <- scriptedInput{ev: restoreEvent("%1")} // no record left: a no-op
+	close(stream.in)
+
+	if err := waitErr(t, done); err != nil {
+		t.Fatalf("SendInput: %v", err)
+	}
+	wantCalls(t, cmd,
+		"resize-window -t %1 -x 120 -y 40",
+		"resize-window -t %1 -x 140 -y 50",
+		"resize-window -t %1 -x 80 -y 24",
+	)
+	if stream.summary.GetEvents() != 3 {
+		t.Errorf("summary = %+v, want events=3 (the no-op restore uncounted)", stream.summary)
+	}
+}
+
+// TestSendInput_RecordFollowsExternalResizesBetweenFocusSessions pins the
+// attribution contract: the pre-focus size is recorded at the moment this
+// stream starts driving the Pane, so an external resize between focus
+// sessions is what the next restore returns to — never overwritten by a
+// stale record.
+func TestSendInput_RecordFollowsExternalResizesBetweenFocusSessions(t *testing.T) {
+	hub := newPaneHub()
+	wp := sizedPane(80, 24)
+	hub.put("%1", wp)
+	cmd := &recordingCommander{}
+	svc := newHerdService(context.Background(), NewRegistry(), hub, cmd)
+
+	stream, done := runSendInput(svc, context.Background())
+	stream.in <- scriptedInput{ev: resizeEvent("%1", 120, 30)}
+	stream.in <- scriptedInput{ev: restoreEvent("%1")}
+
+	// Someone resizes the pane from the tmux side while nothing is focused
+	// (the watcher's reconcile would record exactly this).
+	wp.setSize(100, 40)
+
+	stream.in <- scriptedInput{ev: resizeEvent("%1", 120, 30)}
+	stream.in <- scriptedInput{ev: restoreEvent("%1")}
+	close(stream.in)
+
+	if err := waitErr(t, done); err != nil {
+		t.Fatalf("SendInput: %v", err)
+	}
+	wantCalls(t, cmd,
+		"resize-window -t %1 -x 120 -y 30",
+		"resize-window -t %1 -x 80 -y 24", // first restore: the original size
+		"resize-window -t %1 -x 120 -y 30",
+		"resize-window -t %1 -x 100 -y 40", // second restore: the external size wins
+	)
+}
+
+func TestSendInput_RestoreWithoutResizeIsANoop(t *testing.T) {
+	hub := newPaneHub()
+	hub.put("%1", sizedPane(80, 24))
+	cmd := &recordingCommander{}
+	svc := newHerdService(context.Background(), NewRegistry(), hub, cmd)
+
+	stream, done := runSendInput(svc, context.Background())
+	stream.in <- scriptedInput{ev: restoreEvent("%1")}
+	close(stream.in)
+
+	if err := waitErr(t, done); err != nil {
+		t.Fatalf("SendInput: %v", err)
+	}
+	if len(cmd.calls) != 0 || stream.summary.GetEvents() != 0 {
+		t.Errorf("a restore with no record reached tmux: calls=%v summary=%+v", cmd.calls, stream.summary)
+	}
+}
+
+func TestSendInput_StreamEndRestoresResizedPanes(t *testing.T) {
+	hub := newPaneHub()
+	hub.put("%1", sizedPane(80, 24))
+	cmd := &recordingCommander{}
+	svc := newHerdService(context.Background(), NewRegistry(), hub, cmd)
+
+	stream, done := runSendInput(svc, context.Background())
+	stream.in <- scriptedInput{ev: resizeEvent("%1", 120, 40)}
+	close(stream.in) // the Client vanishes without restoring
+
+	if err := waitErr(t, done); err != nil {
+		t.Fatalf("SendInput: %v", err)
+	}
+	wantCalls(t, cmd,
+		"resize-window -t %1 -x 120 -y 40",
+		"resize-window -t %1 -x 80 -y 24", // implicit restore on stream end
+	)
+	if stream.summary.GetEvents() != 1 {
+		t.Errorf("summary = %+v, want events=1 (the implicit restore uncounted)", stream.summary)
 	}
 }
 

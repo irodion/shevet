@@ -215,6 +215,20 @@ func (s *InputStream) SendResize(paneID string, w, h int) error {
 	return nil
 }
 
+// SendRestore asks the Server to return a Pane to the size it had before
+// this stream's first SendResize of it — the unfocus half of resize-on-focus.
+// The Server owns the record, so the Client carries no size bookkeeping; a
+// restore with no prior resize on this stream is a Server-side no-op.
+func (s *InputStream) SendRestore(paneID string) error {
+	err := s.stream.Send(&shevetv1.InputEvent{Event: &shevetv1.InputEvent_Restore{
+		Restore: &shevetv1.RestoreSize{PaneId: paneID},
+	}})
+	if err != nil {
+		return fmt.Errorf("send restore of pane %s: %w", paneID, err)
+	}
+	return nil
+}
+
 // Close half-closes the stream and returns the Server's summary. After Close
 // the stream must not be used again.
 func (s *InputStream) Close() (InputSummary, error) {
