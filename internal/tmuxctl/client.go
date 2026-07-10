@@ -72,9 +72,10 @@ type Client struct {
 	closeOnce sync.Once
 
 	mu        sync.Mutex
-	pending   []chan reply // FIFO: tmux answers commands in send order
-	guardSeen bool         // the attach guard reply has been consumed
-	guardErr  string       // the guard's text when it was an %error: why the attach failed
+	pending   []pendingReply // FIFO: tmux answers commands in send order
+	groupSeq  uint64         // last CommandsSeq group id handed out (0 = standalone)
+	guardSeen bool           // the attach guard reply has been consumed
+	guardErr  string         // the guard's text when it was an %error: why the attach failed
 
 	// evQueue decouples event delivery from reply routing: the reader
 	// enqueues without ever blocking, a pump goroutine feeds Events().
@@ -240,6 +241,16 @@ func (c *Client) Command(ctx context.Context, args ...string) ([]string, error) 
 	return lines, err
 }
 
+// pendingReply is a waiting command's reply channel plus the CommandsSeq group
+// it belongs to. tmux aborts a ';'-joined sequence after the first error, so
+// on an errored group reply the rest of that group's slots are purged (they
+// will never be answered) to keep later commands matched. group 0 is a
+// standalone command, never purged.
+type pendingReply struct {
+	ch    chan reply
+	group uint64
+}
+
 // CommandSeq is Command plus the reply's control-stream position: any
 // OutputEvent with a smaller Seq was already applied to tmux's screen when
 // this command executed. That ordering is what lets a capture-pane snapshot
@@ -255,7 +266,7 @@ func (c *Client) CommandSeq(ctx context.Context, args ...string) ([]string, uint
 	// Enqueuing and writing must be atomic across callers: tmux matches
 	// replies to commands purely by order.
 	c.mu.Lock()
-	c.pending = append(c.pending, ch)
+	c.pending = append(c.pending, pendingReply{ch: ch})
 	_, err := io.WriteString(c.stdin, line)
 	c.mu.Unlock()
 	if err != nil {
@@ -273,6 +284,76 @@ func (c *Client) CommandSeq(ctx context.Context, args ...string) ([]string, uint
 	case <-ctx.Done():
 		return nil, 0, ctx.Err()
 	}
+}
+
+// CommandsSeq runs several tmux commands as one atomic control-mode line —
+// joined by tmux's `;` command separator — and returns each command's reply
+// body in order, plus the stream position of the first reply. tmux executes a
+// `;`-joined sequence back-to-back with no %output interleaved between the
+// replies, so every reply pins to a single stream position: a capture-pane
+// snapshot and a display-message read in the same sequence observe the same
+// screen (verified against tmux 3.7b). Sending the two commands separately
+// cannot promise that — output can land between them — which is the seed skew
+// that shifts a reconnected pane's screen (issue #53).
+//
+// tmux runs a sequence up to the first error and stops: the erroring command
+// emits its block (surfaced here as the error), and every command after it is
+// skipped with no block. completeReply purges those skipped slots by group so
+// later commands stay matched. Both this and the no-interleave guarantee are
+// long-standing tmux command-queue behaviors, relied on across the ≥ 3.2 floor
+// (ADR-0008) and verified on 3.7b.
+func (c *Client) CommandsSeq(ctx context.Context, cmds ...[]string) ([][]string, uint64, error) {
+	if len(cmds) == 0 {
+		return nil, 0, nil
+	}
+	parts := make([]string, len(cmds))
+	for i, args := range cmds {
+		quoted := make([]string, len(args))
+		for j, a := range args {
+			quoted[j] = quoteArg(a)
+		}
+		parts[i] = strings.Join(quoted, " ")
+	}
+	line := strings.Join(parts, " ; ") + "\n"
+
+	chans := make([]chan reply, len(cmds))
+	// Enqueue every reply channel and write the one line atomically: tmux
+	// matches replies to commands purely by order, so the blocks for this
+	// sequence must claim consecutive slots with no other command's write
+	// interleaved. The shared group id lets completeReply purge the tail of
+	// this sequence if tmux aborts it on an error.
+	c.mu.Lock()
+	c.groupSeq++
+	group := c.groupSeq
+	for i := range chans {
+		chans[i] = make(chan reply, 1)
+		c.pending = append(c.pending, pendingReply{ch: chans[i], group: group})
+	}
+	_, err := io.WriteString(c.stdin, line)
+	c.mu.Unlock()
+	if err != nil {
+		return nil, 0, fmt.Errorf("tmuxctl: send commands: %w", err)
+	}
+
+	replies := make([][]string, len(cmds))
+	var firstSeq uint64
+	for i, ch := range chans {
+		select {
+		case r := <-ch:
+			if r.isErr {
+				return nil, 0, fmt.Errorf("tmuxctl: tmux: %s", strings.Join(r.lines, " "))
+			}
+			if i == 0 {
+				firstSeq = r.seq
+			}
+			replies[i] = r.lines
+		case <-c.done:
+			return nil, 0, c.streamErr()
+		case <-ctx.Done():
+			return nil, 0, ctx.Err()
+		}
+	}
+	return replies, firstSeq, nil
 }
 
 // Close detaches (EOF on stdin) and waits for tmux to exit, escalating to a
@@ -401,9 +482,22 @@ func (c *Client) completeReply(r reply) {
 	if len(c.pending) == 0 {
 		return
 	}
-	ch := c.pending[0]
+	p := c.pending[0]
 	c.pending = c.pending[1:]
-	ch <- r
+	p.ch <- r
+
+	// tmux aborts a ';'-sequence after an error, so the remaining commands in
+	// this group get no reply block. Purge their slots here — in the reader
+	// thread, before the next block is routed — or the following command would
+	// be answered from a stranded slot. Done under the same lock hold, so no
+	// block can slip in between.
+	if r.isErr && p.group != 0 {
+		for len(c.pending) > 0 && c.pending[0].group == p.group {
+			stranded := c.pending[0].ch
+			c.pending = c.pending[1:]
+			stranded <- reply{isErr: true, lines: []string{"tmux aborted the command sequence"}}
+		}
+	}
 }
 
 // streamErr describes why the stream ended, for commands it stranded.
