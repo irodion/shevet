@@ -156,10 +156,9 @@ func Attach(ctx context.Context, opts Options) (*Client, error) {
 	// attach args) keeps it one well-defined command after the attach is
 	// proven live, and switches pane output to the %extended-output form.
 	if opts.PauseAfter > 0 {
+		// Round up to whole seconds; the enclosing PauseAfter > 0 guard makes
+		// the result at least 1.
 		secs := int(math.Ceil(opts.PauseAfter.Seconds()))
-		if secs < 1 {
-			secs = 1
-		}
 		if _, err := c.Command(probeCtx, "refresh-client", "-f", fmt.Sprintf("pause-after=%d", secs)); err != nil {
 			c.Close() //nolint:errcheck // already failing; process cleanup only
 			return nil, fmt.Errorf("tmuxctl: enable pause-after flow control: %w", err)
