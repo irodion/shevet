@@ -56,6 +56,12 @@ type subscriber struct {
 // burst fits without a spurious pause, small enough to bound per-pane memory.
 const opsQueue = 64
 
+// maxRetainedBatch caps the coalescing buffer an idle pane keeps between
+// wakeups. A normal wakeup's output fits well under this, so the buffer is
+// reused; a flood that coalesces far more is written and then released rather
+// than pinned at the high-water mark for the pane's lifetime (ADR-0008).
+const maxRetainedBatch = 64 * 1024
+
 // pipeline is the per-Pane render pipeline: it owns the Pane's emulator
 // (one goroutine end-to-end, ADR-0006), coalesces damage on the 16ms
 // window, and fans flushes out to subscribers.
@@ -242,7 +248,15 @@ func (p *pipeline) run(w, h int, newEmu func(w, h int) emu.Emulator) {
 			return
 		}
 		term.Write(outBatch) //nolint:errcheck // the emulator consumes everything
-		outBatch = outBatch[:0]
+		// Reuse the buffer across wakeups so a busy pane doesn't re-allocate
+		// each flush, but release a one-off flood's peak instead of pinning it
+		// for the pane's lifetime — the branch's memory stays bounded when the
+		// pane goes idle (ADR-0008), not stuck at the high-water mark.
+		if cap(outBatch) > maxRetainedBatch {
+			outBatch = nil
+		} else {
+			outBatch = outBatch[:0]
+		}
 		dirty = true
 		arm()
 	}
@@ -328,5 +342,9 @@ func (p *pipeline) run(w, h int, newEmu func(w, h int) emu.Emulator) {
 		// Flush output that trailed the last control op (or the whole burst
 		// when it was output-only).
 		writeBatch()
+		// Release the burst's payload references before blocking for the next
+		// wakeup: burst[:0] on the next gather would otherwise leave the tail
+		// of a large flood pinning its opOutput payloads until overwritten.
+		clear(burst)
 	}
 }
