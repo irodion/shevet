@@ -44,8 +44,8 @@ The interactive TUI role of the shevet binary. Runs on the developer's local mac
 _Avoid_: frontend, dashboard (dashboard is the *screen* the Client renders, not the process)
 
 **Focus Lease**:
-Exclusive authority over a Pane's geometry — its canonical size and the eventual restore of its pre-drive size — held by at most one Client at a time, naming who is driving. Driving a Pane — the first keystroke or Pane resize a Client sends it — steals the lease from any holder; selecting, viewing, or rearranging tiles (a Client-local act that never touches the Pane) does not. Keystrokes themselves are stolen-not-blocked, never dropped: the lease arbitrates geometry and legibility, not typing. Clients without the lease view that Pane read-only.
-_Avoid_: lock (a lease is stolen by driving, never waited on)
+Exclusive authority over a Pane's geometry — its canonical size and the eventual restore of its pre-drive size — held by at most one Client at a time. A Pane resize (a Focus act) steals the lease from any holder; keystrokes, selection, viewing, and tile rearrangement never do — input is always delivered without moving geometry authority, so typing into a tile cannot strand another Client's Focus. Only the holder's restore, or its disconnect, returns the Pane to its pre-drive size.
+_Avoid_: lock (a lease is stolen by resize, never waited on)
 
 **Tiles**:
 The dashboard's default surface: the whole Client viewport divided among the Herd, one live tile per Pane while readable room remains — a Pane joining splits a tile, a Pane leaving returns its space, and Panes past readable capacity roll up into a single "+N more" tile. The selected tile is live: plain keystrokes flow to its Agent; every dashboard verb sits behind the one reserved leader. The developer organizes tiles (order, size); the layout never centers, pads, or leaves the viewport unused.
