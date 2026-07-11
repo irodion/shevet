@@ -44,8 +44,24 @@ The interactive TUI role of the shevet binary. Runs on the developer's local mac
 _Avoid_: frontend, dashboard (dashboard is the *screen* the Client renders, not the process)
 
 **Focus Lease**:
-The exclusive right to send input and resize a Pane, held by at most one Client at a time. Entering a Pane takes the lease (stealing it from another Client if held); Clients without the lease view that Pane read-only.
-_Avoid_: lock (a lease is stolen by focus, never waited on)
+Exclusive authority over a Pane's geometry — its canonical size and the eventual restore of its pre-drive size — held by at most one Client at a time. A Pane resize (a Focus act) steals the lease from any holder; keystrokes, selection, viewing, and tile rearrangement never do — input is always delivered without moving geometry authority, so typing into a tile cannot strand another Client's Focus. Only the holder's restore, or its disconnect, returns the Pane to its pre-drive size.
+_Avoid_: lock (a lease is stolen by resize, never waited on)
+
+**Tiles**:
+The dashboard's default surface: the whole Client viewport divided among the Herd, one live tile per Pane while readable room remains — a Pane joining splits a tile, a Pane leaving returns its space, and Panes past readable capacity roll up into a single "+N more" tile. The selected tile is live: plain keystrokes flow to its Agent; every dashboard verb sits behind the one reserved leader. The developer organizes tiles (order, size); the layout never centers, pads, or leaves the viewport unused.
+_Avoid_: grid (reserved for the cell-grid vocabulary of a Pane's screen), mosaic
+
+**Overview**:
+A transient orientation surface — the OS window-overview analogue: the Herd as uniform cards for triage at a glance. Opened by a dedicated shortcut; picking a Pane jumps straight to Focus on it, dismissing returns to Tiles. Never dwelled in, never receives Agent-bound keystrokes.
+_Avoid_: mosaic, card view, grid view
+
+**Focus**:
+The surface that devotes the dashboard to a single Pane for direct interaction; entering resizes the Pane to the viewport — a driving act, so the Focus Lease follows. A Shevet bar stays visible — Focus narrows attention to one Agent without blinding the developer to the Herd.
+_Avoid_: zoom, fullscreen (a bar remains), maximize
+
+**Leader**:
+The single reserved key that opens the dashboard's verb layer; every other keystroke in Tiles and Focus belongs to the Agent. Configurable — the one key Shevet withholds from Agents.
+_Avoid_: prefix (tmux's word — inviting confusion with the tmux server underneath), hotkey
 
 ## Flagged ambiguities
 
