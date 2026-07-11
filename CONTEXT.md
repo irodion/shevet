@@ -44,7 +44,7 @@ The interactive TUI role of the shevet binary. Runs on the developer's local mac
 _Avoid_: frontend, dashboard (dashboard is the *screen* the Client renders, not the process)
 
 **Focus Lease**:
-The exclusive right to send input and resize a Pane, held by at most one Client at a time. Driving a Pane — the first keystroke or Pane resize a Client sends it — steals the lease from any holder; selecting, viewing, or rearranging tiles (a Client-local act that never touches the Pane) does not. Clients without the lease view that Pane read-only.
+Exclusive authority over a Pane's geometry — its canonical size and the eventual restore of its pre-drive size — held by at most one Client at a time, naming who is driving. Driving a Pane — the first keystroke or Pane resize a Client sends it — steals the lease from any holder; selecting, viewing, or rearranging tiles (a Client-local act that never touches the Pane) does not. Keystrokes themselves are stolen-not-blocked, never dropped: the lease arbitrates geometry and legibility, not typing. Clients without the lease view that Pane read-only.
 _Avoid_: lock (a lease is stolen by driving, never waited on)
 
 **Tiles**:
