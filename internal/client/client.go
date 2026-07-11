@@ -197,6 +197,38 @@ func (s *InputStream) SendKeys(paneID string, data []byte) error {
 	return nil
 }
 
+// SendResize asks the Server to resize a Pane to w×h cells — the
+// resize-on-focus contract: a focusing Client sends its viewport size, and on
+// unfocus the Pane's prior size. Confirmation arrives on the Pane's render
+// stream as a PaneResized, never here. A non-positive size is a programming
+// error and is rejected before it can reach the wire.
+func (s *InputStream) SendResize(paneID string, w, h int) error {
+	if w <= 0 || h <= 0 {
+		return fmt.Errorf("resize pane %s: implausible size %dx%d", paneID, w, h)
+	}
+	err := s.stream.Send(&shevetv1.InputEvent{Event: &shevetv1.InputEvent_Resize{
+		Resize: &shevetv1.ResizeRequest{PaneId: paneID, Width: uint32(w), Height: uint32(h)},
+	}})
+	if err != nil {
+		return fmt.Errorf("send resize of pane %s: %w", paneID, err)
+	}
+	return nil
+}
+
+// SendRestore asks the Server to return a Pane to the size it had before
+// this stream's first SendResize of it — the unfocus half of resize-on-focus.
+// The Server owns the record, so the Client carries no size bookkeeping; a
+// restore with no prior resize on this stream is a Server-side no-op.
+func (s *InputStream) SendRestore(paneID string) error {
+	err := s.stream.Send(&shevetv1.InputEvent{Event: &shevetv1.InputEvent_Restore{
+		Restore: &shevetv1.RestoreSize{PaneId: paneID},
+	}})
+	if err != nil {
+		return fmt.Errorf("send restore of pane %s: %w", paneID, err)
+	}
+	return nil
+}
+
 // Close half-closes the stream and returns the Server's summary. After Close
 // the stream must not be used again.
 func (s *InputStream) Close() (InputSummary, error) {

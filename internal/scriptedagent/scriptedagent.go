@@ -45,6 +45,7 @@ const (
 	opAwaitLine           // await-line: block until a line arrives on stdin
 	opReadRaw             // read-raw <count> <path>: capture count raw stdin bytes to a file
 	opSleep               // sleep <duration>: explicit wall-clock delay
+	opSpam                // spam <count> <text>: flood count numbered lines as fast as possible
 	opExit                // exit <code>: stop with the given exit code
 )
 
@@ -126,6 +127,19 @@ func parseStep(verb, arg string) (step, error) {
 			return step{}, fmt.Errorf("sleep: %w", err)
 		}
 		return step{op: opSleep, dur: dur}, nil
+	case "spam":
+		countStr, text, ok := strings.Cut(strings.TrimLeft(arg, " \t"), " ")
+		count, err := strconv.Atoi(countStr)
+		if err != nil {
+			return step{}, fmt.Errorf("spam: line count: %w", err)
+		}
+		if count < 0 {
+			return step{}, fmt.Errorf("spam: negative line count %d", count)
+		}
+		if !ok || strings.TrimSpace(text) == "" {
+			return step{}, errors.New("spam: want <count> <text>")
+		}
+		return step{op: opSpam, count: count, text: text}, nil
 	case "exit":
 		code, err := strconv.Atoi(strings.TrimSpace(arg))
 		if err != nil {
@@ -165,11 +179,35 @@ func (s *Script) Run(stdin io.Reader, stdout io.Writer) (int, error) {
 			}
 		case opSleep:
 			time.Sleep(st.dur)
+		case opSpam:
+			if err := spam(stdout, st.count, st.text); err != nil {
+				return 0, fmt.Errorf("spam: %w", err)
+			}
 		case opExit:
 			return st.code, nil
 		}
 	}
 	return 0, nil
+}
+
+// spam floods count lines onto stdout as fast as the pty will carry them —
+// the deterministic flood generator for the one-flooding-Pane-does-not-stall-
+// the-others e2e tests (the Server-side backpressure it leans on is
+// ADR-0008). Each line is the text plus a running counter, so every line is
+// unique (maximal damage, no coalescible repeats) yet fully deterministic.
+// Writes are buffered so the flood saturates the pane, not the syscall
+// boundary.
+func spam(stdout io.Writer, count int, text string) error {
+	w := bufio.NewWriter(stdout)
+	for i := 1; i <= count; i++ {
+		if _, err := fmt.Fprintf(w, "%s %d\n", text, i); err != nil {
+			return err
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return fmt.Errorf("flush: %w", err)
+	}
+	return nil
 }
 
 // readRaw captures exactly count bytes of input verbatim and writes them to

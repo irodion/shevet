@@ -7,24 +7,42 @@ import (
 	"github.com/irodion/shevet/internal/grid"
 )
 
-// renderPane draws a Pane grid as styled terminal lines for the Bubble Tea
-// renderer (which handles cell diffing against the real terminal). Styles
-// are emitted as raw SGR sequences grouped into runs — a per-cell lipgloss
-// style would re-emit codes for every cell.
-//
-// The cursor, when visible, is shown by reverse-videoing its cell: the real
-// terminal cursor belongs to the dashboard, not to the watched Pane.
+// renderPane draws a whole Pane grid as styled terminal lines for the Bubble
+// Tea renderer (which handles cell diffing against the real terminal).
 func renderPane(g *grid.Grid, cursor grid.Cursor) string {
 	w, h := g.Size()
+	return renderRegion(g, cursor, 0, 0, w, h)
+}
+
+// renderRegion draws the w×h region of g anchored at (x0, y0) — the whole
+// grid for a focused Pane, a cropped live thumbnail for a card. Styles are
+// emitted as raw SGR sequences grouped into runs — a per-cell lipgloss style
+// would re-emit codes for every cell.
+//
+// Every row is rendered to exactly w columns: positions outside the grid
+// read as default cells, so a region larger than the Pane pads with blanks
+// and a smaller one clips. A wide grapheme that would cross the region's
+// right edge is rendered as blanks instead of overflowing it. The cursor,
+// when visible and inside the region, is shown by reverse-videoing its cell:
+// the real terminal cursor belongs to the dashboard, not to the watched
+// Pane.
+func renderRegion(g *grid.Grid, cursor grid.Cursor, x0, y0, w, h int) string {
 	var b strings.Builder
 	b.Grow(w * h * 2)
 
-	for y := 0; y < h; y++ {
+	for ry := 0; ry < h; ry++ {
+		y := y0 + ry
 		var last grid.Cell // zero: the default style an SGR reset yields
-		for x := 0; x < w; {
+		for rx := 0; rx < w; {
+			x := x0 + rx
 			c := g.At(x, y)
 			if !cursor.Hidden && x == cursor.X && y == cursor.Y {
 				c.Attrs ^= grid.AttrReverse
+			}
+			if c.Content != "" && rx+max(c.Width, 1) > w {
+				// The grapheme would cross the right edge: blank the cell,
+				// keeping its style, rather than overflow the region.
+				c.Content = ""
 			}
 			if !sameStyle(c, last) {
 				writeSGR(&b, c)
@@ -33,14 +51,14 @@ func renderPane(g *grid.Grid, cursor grid.Cursor) string {
 
 			if c.Content == "" {
 				b.WriteByte(' ')
-				x++
+				rx++
 				continue
 			}
 			b.WriteString(c.Content)
-			x += max(c.Width, 1)
+			rx += max(c.Width, 1)
 		}
 		b.WriteString("\x1b[0m")
-		if y < h-1 {
+		if ry < h-1 {
 			b.WriteByte('\n')
 		}
 	}

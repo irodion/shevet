@@ -31,6 +31,7 @@ loudly instead of desynchronizing a test.
 | `await-line` | none | block until a line arrives on stdin |
 | `read-raw <count> <path>` | byte count, then a file path | capture exactly `count` bytes of input **verbatim** and write them to `path` |
 | `sleep <duration>` | Go duration (`200ms`, `3s`) | wall-clock delay (discouraged; see above) |
+| `spam <count> <text>` | line count, then text to end of line | flood `count` lines of `<text> <i>` (a running counter) to stdout as fast as possible — the flood generator for does-not-stall-others tests |
 | `exit <code>` | integer | terminate with the exit code (0–255) |
 
 ### `read-raw`: byte-exact input capture

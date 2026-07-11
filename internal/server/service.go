@@ -8,6 +8,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/irodion/shevet/internal/grid"
 	"github.com/irodion/shevet/internal/inject"
 	"github.com/irodion/shevet/internal/wire"
 	shevetv1 "github.com/irodion/shevet/proto/shevet/v1"
@@ -137,6 +138,14 @@ func (s *herdService) SendInput(stream shevetv1.HerdService_SendInputServer) err
 	defer cancel()
 	defer context.AfterFunc(s.serveCtx, cancel)()
 
+	// saved holds, per Pane, the size it had before this stream's first
+	// ResizeRequest for it — the Server-side half of resize-on-focus. The
+	// record's life is the stream's: however the stream ends, Panes left
+	// resized are restored (declared after the cancel defers, so the
+	// restores still run under a live injectCtx on a Client hangup).
+	saved := make(map[string]grid.Size)
+	defer s.restoreAll(injectCtx, saved)
+
 	var summary shevetv1.SendInputSummary
 	for {
 		select {
@@ -151,7 +160,7 @@ func (s *herdService) SendInput(stream shevetv1.HerdService_SendInputServer) err
 			if r.err != nil {
 				return r.err //nolint:wrapcheck // already a gRPC-transport error
 			}
-			if err := s.injectEvent(injectCtx, r.ev, &summary); err != nil {
+			if err := s.injectEvent(injectCtx, r.ev, saved, &summary); err != nil {
 				return err
 			}
 		}
@@ -163,13 +172,23 @@ func (s *herdService) SendInput(stream shevetv1.HerdService_SendInputServer) err
 // doesn't handle yet, is dropped and left uncounted — a benign race, not an
 // error. An injection failure against a live Pane is returned as a gRPC error
 // that ends the stream.
-func (s *herdService) injectEvent(ctx context.Context, ev *shevetv1.InputEvent, summary *shevetv1.SendInputSummary) error {
-	keys := ev.GetKeys()
-	if keys == nil {
-		// A future event kind (focus, resize, paste, mouse). Ignore it
+func (s *herdService) injectEvent(ctx context.Context, ev *shevetv1.InputEvent, saved map[string]grid.Size, summary *shevetv1.SendInputSummary) error {
+	switch ev := ev.GetEvent().(type) {
+	case *shevetv1.InputEvent_Keys:
+		return s.injectKeys(ctx, ev.Keys, summary)
+	case *shevetv1.InputEvent_Resize:
+		return s.injectResize(ctx, ev.Resize, saved, summary)
+	case *shevetv1.InputEvent_Restore:
+		return s.injectRestore(ctx, ev.Restore.GetPaneId(), saved, summary)
+	default:
+		// A future event kind (focus, paste, mouse). Ignore it
 		// forward-compatibly.
 		return nil
 	}
+}
+
+// injectKeys delivers one KeyBytes event to its Pane through the tmux seam.
+func (s *herdService) injectKeys(ctx context.Context, keys *shevetv1.KeyBytes, summary *shevetv1.SendInputSummary) error {
 	paneID, data := keys.GetPaneId(), keys.GetData()
 
 	// The Pane must be in the Herd. Resolving it here also means input can
@@ -188,6 +207,88 @@ func (s *herdService) injectEvent(ctx context.Context, ev *shevetv1.InputEvent, 
 	summary.Events++
 	summary.Bytes += uint64(len(data))
 	return nil
+}
+
+// maxResizeDim bounds accepted resize requests to what tmux itself allows
+// (WINDOW_MAXIMUM, 10000): a request past it would not be applied but would
+// come back as a tmux %error — which, like any injection error, ends the
+// whole Control Input stream. Dropping it here keeps a garbled request from
+// costing the Client its keystroke stream. Stricter than maxPaneDim, which
+// bounds what the Server accepts *from* tmux, not what it asks of it.
+const maxResizeDim = 10000
+
+// injectResize realizes one ResizeRequest against tmux. A request for a Pane
+// not in the Herd is dropped like a keystroke would be (the Pane can exit
+// while the request is in flight), and so is a geometry tmux would refuse —
+// so a garbled request never reaches tmux. The stream's first resize of a
+// Pane records the size being displaced, from the watcher's authoritative
+// geometry — attribution by construction: the record is written at the one
+// moment this stream starts driving the Pane, so no later event needs to be
+// classified as ours or the world's. Confirmation is not synthesized here:
+// tmux reports the resize and the watcher relays it to every subscriber of
+// the Pane's render pipeline as a PaneResized plus a re-seed.
+func (s *herdService) injectResize(ctx context.Context, req *shevetv1.ResizeRequest, saved map[string]grid.Size, summary *shevetv1.SendInputSummary) error {
+	paneID := req.GetPaneId()
+	w, h := int(req.GetWidth()), int(req.GetHeight())
+	if w <= 0 || h <= 0 || w > maxResizeDim || h > maxResizeDim {
+		return nil
+	}
+	wp := s.hub.get(paneID)
+	if wp == nil {
+		return nil
+	}
+	if s.injector == nil {
+		return status.Error(codes.Unavailable, "server has no tmux attachment to resize panes")
+	}
+	if _, ok := saved[paneID]; !ok {
+		if pw, ph := wp.size(); pw > 0 && ph > 0 {
+			// A pane racing its own birth (no reconcile yet) records
+			// nothing: restoring to a made-up size would be worse than
+			// leaving the resize in place.
+			saved[paneID] = grid.Size{W: pw, H: ph}
+		}
+	}
+	if err := inject.Resize(ctx, s.injector, paneID, w, h); err != nil {
+		return status.Errorf(codes.Unavailable, "resize pane %s: %v", paneID, err)
+	}
+	summary.Events++
+	return nil
+}
+
+// injectRestore returns a Pane to its recorded pre-resize size and forgets
+// the record — the unfocus half of resize-on-focus. Without a record (this
+// stream never resized the Pane) or with the Pane gone it is a no-op; the
+// record is dropped either way, so a departed Pane cannot pin one.
+func (s *herdService) injectRestore(ctx context.Context, paneID string, saved map[string]grid.Size, summary *shevetv1.SendInputSummary) error {
+	size, ok := saved[paneID]
+	if !ok {
+		return nil
+	}
+	delete(saved, paneID)
+	if s.hub.get(paneID) == nil {
+		return nil
+	}
+	if s.injector == nil {
+		return status.Error(codes.Unavailable, "server has no tmux attachment to resize panes")
+	}
+	if err := inject.Resize(ctx, s.injector, paneID, size.W, size.H); err != nil {
+		return status.Errorf(codes.Unavailable, "restore pane %s: %v", paneID, err)
+	}
+	summary.Events++
+	return nil
+}
+
+// restoreAll returns every Pane this stream left resized to its recorded
+// size, when the stream ends however it ends — a Client that vanished
+// mid-focus must not leave a Pane stuck at its viewport size. Best-effort:
+// the Pane may be gone, or the whole Server may be shutting down.
+func (s *herdService) restoreAll(ctx context.Context, saved map[string]grid.Size) {
+	for paneID, size := range saved {
+		if s.hub.get(paneID) == nil || s.injector == nil {
+			continue
+		}
+		inject.Resize(ctx, s.injector, paneID, size.W, size.H) //nolint:errcheck // best-effort teardown
+	}
 }
 
 // inputResult is one delivery from the Control Input stream.
