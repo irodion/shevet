@@ -44,8 +44,24 @@ The interactive TUI role of the shevet binary. Runs on the developer's local mac
 _Avoid_: frontend, dashboard (dashboard is the *screen* the Client renders, not the process)
 
 **Focus Lease**:
-The exclusive right to send input and resize a Pane, held by at most one Client at a time. Entering a Pane takes the lease (stealing it from another Client if held); Clients without the lease view that Pane read-only.
-_Avoid_: lock (a lease is stolen by focus, never waited on)
+The exclusive right to send input and resize a Pane, held by at most one Client at a time. Driving a Pane — the first keystroke or resize a Client sends it, from Tiles or Focus — steals the lease from any holder; selecting or viewing never does. Clients without the lease view that Pane read-only.
+_Avoid_: lock (a lease is stolen by driving, never waited on)
+
+**Tiles**:
+The dashboard's default surface: the whole Client viewport divided among the Herd, one live tile per Pane — a Pane joining splits a tile, a Pane leaving returns its space. The selected tile is live: plain keystrokes flow to its Agent; every dashboard verb sits behind the one reserved leader. The developer organizes tiles (order, size); the layout never centers, pads, or leaves the viewport unused.
+_Avoid_: grid (reserved for the cell-grid vocabulary of a Pane's screen), mosaic
+
+**Overview**:
+A transient orientation surface — the OS window-overview analogue: the Herd as uniform cards for triage at a glance. Opened by a dedicated shortcut; picking a Pane jumps straight to Focus on it, dismissing returns to Tiles. Never dwelled in, never receives Agent-bound keystrokes.
+_Avoid_: mosaic, card view, grid view
+
+**Focus**:
+The surface that devotes the dashboard to a single Pane for direct interaction, taking its Focus Lease on entry. A Shevet bar stays visible — Focus narrows attention to one Agent without blinding the developer to the Herd.
+_Avoid_: zoom, fullscreen (a bar remains), maximize
+
+**Leader**:
+The single reserved key that opens the dashboard's verb layer; every other keystroke in Tiles and Focus belongs to the Agent. Configurable — the one key Shevet withholds from Agents.
+_Avoid_: prefix (tmux's word — inviting confusion with the tmux server underneath), hotkey
 
 ## Flagged ambiguities
 
